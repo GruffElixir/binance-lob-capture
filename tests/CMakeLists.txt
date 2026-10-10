@@ -1,0 +1,25 @@
+include(FetchContent)
+
+# Extract archives with the current time so rebuilds after a re-download are correct.
+if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif()
+
+FetchContent_Declare(googletest
+    URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz
+    URL_HASH SHA256=65fab701d9829d38cb77c14acdc431d2108bfdbf8979e40eb8ae567edf10b27c)
+set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
+
+# Lands at ./build/tests/unit_tests, the path used by the README and the reviewer checklist.
+add_executable(unit_tests
+    smoke_test.cpp)
+target_link_libraries(unit_tests PRIVATE blc_core GTest::gtest_main)
+blc_set_warnings(unit_tests)
+
+# `cmake --build build --target tests` is the documented way to build the test suite.
+add_custom_target(tests DEPENDS unit_tests)
+
+include(GoogleTest)
+gtest_discover_tests(unit_tests)

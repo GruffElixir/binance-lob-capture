@@ -1,0 +1,37 @@
+# --- Required by the assignment ---------------------------------------------
+build/
+*.csv
+*.o
+*.a
+*.so
+.env
+config/secrets.json
+
+# The curated 1-2 minute sample run is part of the submission and must stay tracked.
+!samples/**/*.csv
+
+# --- Build trees and tooling ------------------------------------------------
+build-*/
+cmake-build-*/
+out/
+CMakeUserPresets.json
+compile_commands.json
+.cache/
+Testing/
+
+# --- Run outputs ------------------------------------------------------------
+output/
+replay_output/
+*.log
+perf.data*
+callgrind.out.*
+massif.out.*
+vgcore.*
+
+# --- Editors / OS -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

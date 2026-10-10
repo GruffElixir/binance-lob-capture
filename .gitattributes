@@ -1,0 +1,11 @@
+# Normalize all text to LF so the tree builds identically on Linux, WSL and Windows.
+* text=auto eol=lf
+
+# CSV fixtures and samples are compared byte-for-byte by the replay tests:
+# never let git rewrite their bytes.
+*.csv -text
+*.jsonl -text
+
+*.sh text eol=lf
+*.pdf binary
+*.png binary

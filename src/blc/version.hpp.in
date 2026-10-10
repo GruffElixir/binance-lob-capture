@@ -1,0 +1,9 @@
+#pragma once
+
+#include <string_view>
+
+namespace blc {
+
+inline constexpr std::string_view kVersion = "@PROJECT_VERSION@";
+
+}  // namespace blc

@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  # Exactly the prerequisites listed in the README (Ubuntu 22.04). git and ca-certificates are
+  # only needed by the CI container itself (checkout, HTTPS downloads).
+  README_APT_PACKAGES: cmake ninja-build g++-12 libssl-dev libboost-all-dev zlib1g-dev
+  CI_APT_PACKAGES: git ca-certificates
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    # Pin the OS image the reviewers use instead of relying on a runner image that may retire.
+    container: ubuntu:22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc-12 / Release
+            cxx: g++-12
+            extra_packages: ""
+          - name: clang-15 / Release
+            cxx: clang++-15
+            extra_packages: clang-15
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y $README_APT_PACKAGES $CI_APT_PACKAGES ${{ matrix.extra_packages }}
+
+      - uses: actions/checkout@v5
+
+      - name: Configure (README command, warnings as errors)
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          -DCMAKE_CXX_FLAGS="-Wall -Wextra -O2"
+          -DBLC_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Unit tests (README command)
+        run: |
+          cmake --build build --target tests
+          ./build/tests/unit_tests
+
+      - name: Smoke
+        run: ./build/binance_capture --version
+
+  reviewer-clean-build:
+    name: Reviewer checklist / build from clean
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Install README prerequisites only
+        run: |
+          apt-get update
+          apt-get install -y $README_APT_PACKAGES $CI_APT_PACKAGES
+
+      - uses: actions/checkout@v5
+
+      - name: cmake -B build && cmake --build build
+        run: cmake -B build && cmake --build build
+
+      - name: Binary is at ./build/binance_capture
+        run: ./build/binance_capture --version
