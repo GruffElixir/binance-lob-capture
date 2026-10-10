@@ -1,8 +1,10 @@
 # Design: binance-lob-capture
 
-Approved 2026-10-11. This document is the specification the implementation follows; the README's
-design notes are a summary of it. Requirement IDs (F*, S*, Q*, X*) refer to
-[requirements.md](requirements.md).
+Approved 2026-10-11; revised the same day after design review. This document is the
+specification the implementation follows; the README's design notes summarise it. Requirement
+IDs (F*, S*, Q*, X*) refer to [requirements.md](requirements.md). Features marked
+**(enhancement)** go beyond the brief and are built only after the mandatory behaviour they
+extend is complete.
 
 ## 1. Scope
 
@@ -13,7 +15,8 @@ design notes are a summary of it. Requirement IDs (F*, S*, Q*, X*) refer to
   `<symbol>@trade`, and writes:
   - **Deliverable A** — a market-data audit CSV: one row per inbound data message, holding the
     inner Binance `data` payload.
-  - **Deliverable B** — an order-book CSV: one top-5 snapshot row after each processed event.
+  - **Deliverable B** — an order-book CSV: one top-5 snapshot row after each processed event of a
+    synchronised book.
   - a depth-snapshot sidecar CSV recording the REST snapshots used to synchronise the book, so a
     capture can be replayed exactly.
 - **Replay** — reads saved market-data CSVs (plus their sidecars) and regenerates the order-book
@@ -39,27 +42,27 @@ binance_capture --help | --version
 | `--symbols` | capture | required | Comma-separated, e.g. `BTCUSDT,ETHUSDT`. Case-insensitive (normalised to uppercase); whitespace around items trimmed; each item 2–20 characters of `A–Z0–9`; no duplicates; 1–256 symbols |
 | `--output-dir` | both | capture: `.`; replay: `./replay_output` | Created if missing |
 | `--duration` | capture | `0` = run until SIGINT/SIGTERM | Integer seconds, 0–2 678 400 (31 days), counted from process start |
-| `--no-trade-rows` | both | off | Trades still go to the market-data CSV but produce no order-book rows (§5.6) |
-| `--symbols-per-connection` | capture | `50` | 1 – venue cap (spot 341 = 1023 streams; usdm 66 = 198 streams, §15) |
+| `--no-trade-rows` | both | off | Trades still go to the market-data CSV but produce no order-book rows (§5.8) |
+| `--symbols-per-connection` | capture | `50` | 1 – venue cap (§9); the resulting stream URL must also fit the 8 192-byte limit |
 | `--stats-interval` | both | `10` | Seconds between stats lines on stderr; `0` = final summary only |
-| `--fault-reconnect-every` | capture | `0` = off | Testing aid: force-close every connection each N seconds to exercise reconnect + resync live |
-| `--replay` | replay | — | One or more market-data CSVs, processed in the order given (§7) |
+| `--fault-reconnect-every` | capture | `0` = off | **(enhancement)** Testing aid: force-close every connection each N seconds to exercise reconnect + resync live |
+| `--replay` | replay | — | One or more market-data CSVs; each is replayed independently (§7) |
 
 Both `--opt value` and `--opt=value` are accepted. Unknown options, missing values and invalid
 values are usage errors.
 
 Exit codes: `0` normal completion (including shutdown by signal or `--duration`), `1` runtime
-failure (output I/O error, malformed replay input, unrecoverable configuration error), `2` usage
-error.
+failure (output I/O error including a failed final flush or close, malformed replay input,
+unrecoverable configuration error), `2` usage error.
 
 The default capture `--output-dir` is `.` because the reviewer checklist runs a capture without
 `--output-dir` and then checks `*_orderbook.csv` in the working directory.
 
 ## 3. Output files
 
-### 3.1 Naming, rotation, overwrite
+### 3.1 Naming and lifecycle
 
-Capture writes three files per (venue, symbol, UTC date):
+Capture writes three files per symbol:
 
 | File | Content |
 |---|---|
@@ -69,14 +72,19 @@ Capture writes three files per (venue, symbol, UTC date):
 
 - **One file per symbol** (the brief's per-symbol naming option). The `symbol` column is still
   written. Per-symbol files keep each book independently replayable and its `seqNo` contiguous.
+- **One set of files per run.** `<YYYY-MM-DD>` is the UTC date at process start. Files are never
+  rotated: a capture that crosses UTC midnight stays in the files named after its start date. A
+  run's files are therefore self-contained: each can be replayed on its own, and each order-book
+  file starts with an `R` row.
+- All files for all configured symbols are created at startup, with their header rows.
 - The sidecar deliberately does not match the `market_data_*.csv` or `*_orderbook.csv` globs.
-- `<YYYY-MM-DD>` is the UTC date of the receive timestamp of the record that opened the files.
-- **Rotation:** the three files of a symbol are opened together when its first record arrives.
-  When a record's UTC date is later than the open files' date, all three are flushed, closed and
-  reopened for the new date. Rotation never goes backwards if the wall clock steps back.
-  `seqNo` continues across rotation.
-- **Existing files** are truncated and rewritten; a warning naming each file is logged.
-- **Replay** writes `<output-dir>/<input file stem>_orderbook.csv` for each input file.
+- **Existing files are never overwritten and never cause an error.** A file that already exists
+  is first renamed to `<name>.replaced-<run start, YYYYMMDDTHHMMSSZ>` (adding `-1`, `-2`, … if
+  that name is taken), and a warning names both files. The brief's own README sequence writes
+  several runs into `./output` on the same day, so refusing would break it, and truncating would
+  silently destroy an earlier capture. Renamed files match none of the output globs.
+- **Replay** writes `<output-dir>/<input file stem>_orderbook.csv` for each input file, with the
+  same rename rule.
 
 ### 3.2 CSV encoding (all files)
 
@@ -110,9 +118,8 @@ recv_tsec,recv_tnsec,venue,stream_kind,shard_id,conn_epoch,conn_seq,symbol,paylo
 | `symbol` | text | Uppercase symbol from the stream name, e.g. `BTCUSDT` |
 | `payload_json` | text | The envelope's inner `data` object, minified, one line, CSV-escaped |
 
-- One row per WebSocket data frame with a valid `{"stream":…,"data":…}` envelope for a subscribed
-  stream, in processing order: the processor writes the row immediately before applying the event
-  to the book.
+- One row per WebSocket data frame with a valid envelope for a subscribed stream, in processing
+  order: the processor writes the row before parsing the payload or touching the book.
 - `payload_json` is the received bytes of the `data` value. Binance sends compact JSON (no frame
   in the probe contained whitespace); if a payload ever contains whitespace bytes it is minified
   with `simdjson::minify` before writing, and counted.
@@ -137,8 +144,8 @@ string and a `static_assert` pins the count.
 
 | Column | Type | Value |
 |---|---|---|
-| `tsec`, `tnsec` | int64, int32 | Receive time of the record that produced the row (§4.1); `tsec * 1e9 + tnsec` = ns since the Unix epoch |
-| `seqNo` | uint64 | 0-based, +1 per row of this (venue, symbol) for the process lifetime (§4.4) |
+| `tsec`, `tnsec` | int64, int32 | Receive time of the record that produced the row (§4.1, §5.8); `tsec * 1e9 + tnsec` = ns since the Unix epoch |
+| `seqNo` | uint64 | 0-based, +1 per row of this order-book file (§4.4) |
 | `id` | int32 | Instrument id (§4.3) |
 | `type` | char | Class of the event that produced the row (table below) |
 | `side` | char | `B`, `S` or `N` (table below) |
@@ -147,11 +154,13 @@ string and a `static_assert` pins the count.
 | `ask0`…`ask4` | int64 | Best five ask prices, best (lowest) first, scaled |
 | `ask_size0`…`ask_size4` | int64 | Quantities at those asks, scaled |
 
-A side with fewer than five levels fills the missing levels with price `0` and size `0`.
+Missing levels are written as price `0` and size `0`. This only happens when the exchange side
+itself has fewer than five levels: a row is never emitted while a visible level could be unknown
+(§5.3).
 
 | `type` | Event | `side` |
 |---|---|---|
-| `R` | REST snapshot applied; the book became synchronised (§5.3) | `N` |
+| `R` | REST snapshot applied: a synchronisation completed (§5.4) or a coverage refresh was swapped in (§5.5) | `N` |
 | `D` | Differential depth update (`depthUpdate` on `@depth@100ms`) | `B` if the update has only bid levels, `S` if only ask levels, `N` if both or neither |
 | `P` | Partial depth snapshot (`@depth5@100ms`) | `N` |
 | `T` | Trade (annotation; the book is unchanged) | Book side of the resting (maker) order: `m=true` (buyer is maker) → `B`; `m=false` → `S` |
@@ -168,15 +177,16 @@ illustrative):
 Header (exact):
 
 ```
-recv_tsec,recv_tnsec,venue,symbol,apply_before_row,payload_json
+recv_tsec,recv_tnsec,venue,shard_id,conn_epoch,symbol,apply_before_row,payload_json
 ```
 
 - One row per REST depth snapshot received for the symbol, whether or not it was used.
+- `shard_id` and `conn_epoch` identify the symbol's connection when the response was received
+  (its latest established epoch). Processing uses them exactly like a market-data row's (§5.7).
 - `apply_before_row` is the number of data rows already written to the paired market-data file
   when the processor consumed the snapshot, i.e. the 0-based index of the market-data row it
-  precedes. Replay injects the snapshot at exactly that position. A value equal to the file's
-  row count means after the last row. Rows are written in processing order, so the column is
-  non-decreasing; replay rejects a sidecar where it is not.
+  precedes. A value equal to the file's row count means after the last row. Rows are written in
+  processing order, so the column is non-decreasing; replay rejects a sidecar where it is not.
 - `payload_json` is the minified REST response body (`{"lastUpdateId":…,"bids":[…],"asks":[…]}`,
   plus `E`/`T` on usdm).
 
@@ -184,12 +194,11 @@ recv_tsec,recv_tnsec,venue,symbol,apply_before_row,payload_json
 
 ### 4.1 Timestamps
 
-- **Receive time** = `std::chrono::system_clock::now()` taken in the WebSocket read-completion
-  handler, after the whole message has been read and before any parsing. Nanoseconds since the
-  Unix epoch, UTC (CLOCK_REALTIME on Linux).
+- **Receive time** = `std::chrono::system_clock::now()` taken in the WebSocket (or REST) read-
+  completion handler, after the whole message has been read and before any parsing. Nanoseconds
+  since the Unix epoch, UTC (CLOCK_REALTIME on Linux).
 - `recv_tsec = recv_ns / 1 000 000 000`, `recv_tnsec = recv_ns % 1 000 000 000`.
-- Order-book rows use the receive time of the record that produced them; an `R` row uses the
-  receive time of the REST response.
+- An order-book row uses the receive time of the record whose processing produced it (§5.8).
 - Binance's own times (`E`, `T`) remain available inside `payload_json`. Receive time was chosen
   because spot `depth5` payloads carry no event time, it is uniform across the three streams, and
   replay reproduces it exactly.
@@ -205,7 +214,7 @@ recv_tsec,recv_tnsec,venue,symbol,apply_before_row,payload_json
 - Grammar: `[0-9]+(\.[0-9]+)?`. Fraction digits beyond the 8th must be `0`. The result must not
   exceed `INT64_MAX` (integer part ≤ 92 233 720 368).
 - Rejected inputs — empty string, sign, exponent, any other character, a non-zero 9th+ decimal,
-  overflow — are parse errors: counted, and handled per §5.5. Values are never rounded.
+  overflow — are parse errors: counted, and handled per §5.7. Values are never rounded.
 
 | Input | Scaled int64 |
 |---|---|
@@ -228,8 +237,8 @@ agree. Startup rejects a symbol list containing two symbols with the same id.
 |---|---|---|---|
 | `shard_id` | process | 0 | Symbols are split into shards in `--symbols` order, `--symbols-per-connection` per shard: shard *k* holds symbols *kN* … *kN+N−1* |
 | `conn_epoch` | per shard | 0 | Each successful (re)connection (WebSocket handshake complete) |
-| `conn_seq` | per (shard, epoch) | 0 | Each WebSocket data frame received. A frame rejected as malformed consumes its number, so drops are visible as gaps |
-| `seqNo` | per (venue, symbol) order-book stream | 0 | Each order-book row, continuing across rotated files |
+| `conn_seq` | per (shard, epoch) | 0 | Each WebSocket data frame received. A frame rejected as malformed, or dropped because the queue was full, consumes its number, so losses are visible as gaps |
+| `seqNo` | per order-book file | 0 | Each order-book row |
 
 ## 5. Order book
 
@@ -238,90 +247,160 @@ agree. Startup rejects a symbol list containing two symbols with the same id.
 Each side is a `std::vector<Level{int64 price; int64 qty;}>` kept sorted so that the **best price
 is at the back**: bids ascending, asks descending.
 
-- `set(price, qty)`: binary search (O(log n)); insert, overwrite or erase. Only the elements
-  between the position and the back (the levels *better* than the price) move. Updates cluster at
-  the touch, so the typical cost is a handful of element moves.
-- Top-5 read: O(1) per level, from the back.
-- Capacity is reserved at startup. A side is capped at 20 000 levels; beyond that the worst levels
-  are trimmed in one batch down to 15 000. Trimmed levels are far from the touch and never
-  visible in the top 5; a later diff for such a price re-inserts it with its absolute quantity.
+- **Search:** galloping (exponential) search from the back, then binary search inside the
+  bracket: O(log k), where *k* is the number of levels better than the price.
+- **Insert, overwrite, erase:** only the *k* elements between the position and the back move, so
+  one level update costs O(k) and a message costs the sum over its levels. Updates cluster at the
+  touch, where *k* is small; a deep insert or delete costs up to O(n) contiguous moves
+  (n ≤ 5 000 levels of 16 bytes). This is not O(1) per update in the worst case, and the
+  benchmark (§10) measures deep updates and deletions as well as near-touch traffic.
+- **Top-5 read:** O(1) per level, from the back.
+- **Cap:** 5 000 levels per side. When exceeded, the worst levels are trimmed in one batch down
+  to 4 000 and the coverage boundary is adjusted (§5.3).
+- Storage is reserved to the snapshot size when a snapshot is loaded; afterwards it grows only if
+  diffs add levels, so the steady state does not allocate.
 
 | | Flat vector, best at back (chosen) | `std::map<int64,int64>` |
 |---|---|---|
-| Update near touch | O(log n) search + few contiguous moves; no allocation | O(log n) pointer chasing + node allocation on insert |
-| Deep update | O(n) contiguous move (cheap: 16-byte elements, n ≈ 1000) | O(log n) |
+| Update near touch | O(log k) search + k contiguous moves; no allocation | O(log n) pointer chasing + node allocation on insert |
+| Deep update or delete | Up to O(n) contiguous moves (16-byte elements) | O(log n) |
 | Top-5 read | 5 contiguous loads | 5 node hops |
-| Allocation per message | none after warm-up | one per inserted level |
-
-The trade-off is measured by the book benchmark (§10) and reported in the README.
+| Allocation per message | None after warm-up | One per inserted level |
 
 ### 5.2 Event semantics
 
 - **Diff** (`depthUpdate` on `@depth@100ms`): each `[price, qty]` is the **absolute** quantity at
   that price; `qty == 0` erases the level. Erasing a level that is not in the book is a no-op
   (Binance documents this as normal). Levels are applied in payload order.
-- **REST snapshot**: replaces the whole book.
+- **REST snapshot**: replaces the whole book and resets coverage (§5.3).
 - **depth5** (`@depth5@100ms`): the exact top 5 levels per side at update id *p* (spot:
-  `lastUpdateId`; usdm: `u`). It has **replace** semantics: a level that left the top 5 is simply
-  absent — it is *not* sent with `qty 0` — so depth5 must never be merged level-by-level like a
-  diff. Range replace: for bids with 5 levels, every book level priced ≥ `bid[4]` is replaced by
-  the depth5 bids; with fewer than 5 levels the whole side is replaced. Asks are symmetric
-  (≤ `ask[4]`). §5.4 defines when range replace is used. A depth5 payload with more than 5
-  levels on a side is a parse error.
+  `lastUpdateId`; usdm: `u`). Its semantics are **replace**, not merge: a level that left the top
+  5 is simply absent — it is never sent with `qty 0` — so depth5 must never be applied like a
+  diff. Because the REST + diff book holds strictly more information, this design never writes
+  depth5 into the book; it uses depth5 only as an exact cross-check (§5.6). Patching the top of
+  the book from depth5 would require trusting the levels below the replaced range, which a
+  disagreement has just shown cannot be trusted. A depth5 payload with more than 5 levels on a
+  side is a parse error.
 - **Trade**: never changes the book. Fills already reach the book through the diff stream;
-  applying trades as well would double-count. Trades produce annotation rows only (§5.6).
+  applying trades as well would double-count. Trades produce annotation rows only (§5.8).
 - usdm `depth5` payloads also carry `"e":"depthUpdate"`; the event class is therefore taken from
   the **stream name**, never from the `e` field.
 
-### 5.3 Synchronisation state machine
+### 5.3 Coverage
 
-Each (venue, symbol) book is either **Unsynced** (initial state; no order-book rows) or
-**Synced**. Synchronisation follows Binance's documented procedure for each venue, using a REST
-snapshot with `limit=1000`: spot `GET https://api.binance.com/api/v3/depth?symbol=S&limit=1000`,
-usdm `GET https://fapi.binance.com/fapi/v1/depth?symbol=S&limit=1000`.
+A REST snapshot holds at most `limit` = 1000 levels per side. Measured on 2026-10-11, that
+covered only about 0.24 % of the BTCUSDT price on spot ($197 of bids) and 0.15 % on usdm ($125),
+a range the price can cross within minutes. Binance documents that levels outside the snapshot
+stay unknown until they change. The book therefore tracks how far it is known to be complete.
 
-Let *L* be the snapshot's `lastUpdateId` and *id* the book's last applied update id.
+- A side whose snapshot has **fewer than `limit` levels is complete**: the snapshot holds the
+  entire side.
+- Otherwise its **coverage boundary** is the snapshot's worst price on that side (lowest bid,
+  highest ask). Every price at or better than the boundary is known exactly. Beyond it, only
+  prices that later diffs touched are known; untouched resting levels may exist there.
+- Diffs never move the boundary: a diff beyond it reveals only the prices it names, not the
+  levels in between.
+- Trimming (§5.1) that removes a level at or better than the boundary moves the boundary to the
+  worst remaining level, and the side becomes incomplete.
+- A side's **coverage margin** is the number of levels at or better than its boundary (unbounded
+  for a complete side).
+- A side is **authoritative** if it is complete or its margin is at least 5. Only then can its
+  top 5 be emitted: every level that could appear in the top 5 is known. Zero padding (§3.4)
+  can therefore only occur on a complete side, and means the exchange has fewer levels.
+- After processing any record, if either side is not authoritative, the book becomes Unsynced
+  (counted as `coverage_exhausted`): no row is emitted for that record and a resync starts
+  (§5.4).
+- When either margin falls below 200 levels, a background refresh is requested
+  (**enhancement**, §5.5), so that in normal operation coverage is renewed before it runs out.
 
-**Unsynced, both venues**
+### 5.4 Synchronisation state machine
 
-1. A diff is appended to the sync buffer. If the buffer is not empty and the diff does not
-   continue it — spot: `U == last.u + 1`; usdm: `pu == last.u` — the buffer is cleared first
-   (counted as `buffer_resets`).
-2. A snapshot becomes the *pending* snapshot (replacing an older one).
-3. After either event, **try_sync** runs if there is a pending snapshot and a non-empty buffer:
-   1. Drop buffered diffs that the snapshot already contains — spot: `u ≤ L`; usdm: `u < L`.
-   2. Buffer now empty: wait for more diffs.
-   3. The first remaining diff must bridge the snapshot — spot: `U ≤ L + 1 ≤ u`; usdm:
-      `U ≤ L ≤ u`. If its `U` is too large, the snapshot is too old: discard it and request a new
-      one.
-   4. Otherwise load the snapshot, apply every buffered diff in order, set *id* to the last
-      applied `u`, switch to Synced and emit an `R` row.
-4. The sync buffer holds at most 10 000 diffs. On overflow it is cleared and the newest diff is
-   kept (counted).
-5. The processor requests a snapshot when it enters Unsynced and when it discards a snapshot as
-   too old, with at most one request outstanding per symbol. Request bookkeeping never influences
-   output, which keeps replay exact (§7).
+Each symbol's book is either **Unsynced** (initial state; no order-book rows) or **Synced**.
+Synchronisation follows Binance's documented procedure for each venue, using a REST snapshot with
+`limit=1000`: spot `GET https://api.binance.com/api/v3/depth?symbol=S&limit=1000`, usdm
+`GET https://fapi.binance.com/fapi/v1/depth?symbol=S&limit=1000`.
+
+Let *L* be a snapshot's `lastUpdateId` and *id* the book's last applied update id.
+
+**Sequence classification.** One function classifies a diff (`U`, `u`, and on usdm `pu`) against
+a reference id *r*. It is used everywhere — appending to the window, applying to a Synced book,
+and replaying the window — so the rules cannot drift apart:
+
+| Venue | Stale | Gap | Continues |
+|---|---|---|---|
+| spot | `u ≤ r` | `U > r + 1` | otherwise (`U ≤ r + 1 < u + 1`; overlapping coverage is accepted, as Binance's update rule allows) |
+| usdm | `u ≤ r` | `pu ≠ r` | otherwise |
+
+**Recent-diff window.** Each symbol keeps the most recent contiguous diffs, decoded into owned
+integers, in a circular arena bounded at 20 000 levels and 2 000 diffs. When full, the oldest
+diffs are dropped (counted as `window_trimmed`). A diff is classified against the window's last
+`u`: stale → not appended (counted as `stale_diffs`); gap → the window is cleared and restarts
+with this diff (counted as `window_resets`); continues → appended. While Unsynced the window is
+the sync buffer. While Synced it holds the applied diffs that a background refresh needs (§5.5).
+Dropping the oldest entries is safe because a usable snapshot is always newer than them; if it is
+not, the snapshot is rejected as too old and a fresh one is requested.
+
+**Unsynced:**
+
+1. A diff is appended to the window, then **try_sync** runs.
+2. A snapshot becomes the *pending* snapshot (a newer one replaces an older one), then
+   **try_sync** runs.
+3. A depth5 or trade record is ignored (no row).
+4. **try_sync**, with a pending snapshot and a non-empty window:
+   1. Find the first window diff the snapshot does not already contain — spot: first with
+      `u > L`; usdm: first with `u ≥ L`. If there is none, wait for more diffs.
+   2. That diff must bridge the snapshot — spot: `U ≤ L + 1 ≤ u`; usdm: `U ≤ L ≤ u`. If its `U`
+      is larger, the snapshot is too old: discard it, request a new one (counted as
+      `snapshot_too_old`).
+   3. Otherwise build the book: load the snapshot (setting coverage, §5.3), apply the bridging
+      diff and every later window diff in order, set *id* to the last applied `u`. If both sides
+      are authoritative, switch to Synced and emit one `R` row (§5.8); if not, discard the
+      snapshot and request a new one.
+5. The processor requests a snapshot when the symbol enters Unsynced and whenever it discards one.
+   At most one request per symbol is outstanding. Request bookkeeping never influences output,
+   which keeps replay exact (§7).
 
 The spot bridge condition is written `U ≤ L + 1 ≤ u` to agree with Binance's update rule (an
 event is valid while `U ≤ id + 1`); it accepts an event that starts exactly at `L + 1`.
 
-**Synced, spot** — for each diff:
+**Bootstrap.** Diffs that arrive while Unsynced are bootstrap input, not processed events. They
+are recorded in the market-data CSV as they arrive, but applied only when a snapshot bridges them,
+as one atomic synchronisation step. That step is followed by exactly one `R` row, whose timestamp
+is the receive time of the record that completed it: the snapshot record, or a later diff that
+supplied the bridge. The brief's "row after every applied depthUpdate" is read as applying to
+updates applied to a synchronised book; the bootstrap batch is represented by its `R` row.
 
-- `u ≤ id`: stale, counted; the book is unchanged.
-- `U > id + 1`: gap → §5.5.
-- Otherwise apply it and set `id = u`.
+**Synced** — for each diff, classified against *id*:
 
-**Synced, usdm** — for each diff:
+- Stale: the book is unchanged (counted).
+- Gap: §5.7.
+- Continues: apply it, set `id = u`, append it to the window.
 
-- `u ≤ id`: stale, counted.
-- `pu ≠ id`: gap → §5.5.
-- Otherwise apply it and set `id = u`.
+### 5.5 Background coverage refresh (enhancement)
 
-### 5.4 depth5 cross-check and repair
+Implemented after the mandatory behaviour (§5.3 exhaustion → resync) is complete and tested. It
+renews coverage without interrupting output.
 
-The REST + diff book is authoritative. depth5 is used as an **independent exact cross-check**,
-and its replace semantics are applied only to repair a disagreement. While Unsynced, depth5 is
-ignored. While Synced, with *p* the depth5 id:
+- **Trigger:** Synced, either coverage margin below 200, and no refresh in progress → request a
+  snapshot.
+- **Shadow sync:** when the refresh snapshot arrives, **try_sync** (§5.4) runs on a *shadow* book,
+  with the window of applied diffs as its buffer. If the snapshot is newer than every window diff,
+  it stays pending and try_sync re-runs after each subsequently applied diff. If it is too old,
+  it is discarded and re-requested.
+- **Swap:** when the shadow synchronises it has applied the same diffs as the live book, so both
+  are at the same *id*. Their top 5 levels are compared:
+  - Equal → the shadow (with fresh coverage) replaces the live book (counted as `refresh_ok`).
+  - Different → the shadow still replaces the live book, because it was built by the documented
+    procedure from fresher data; counted as `refresh_mismatch` and logged with both level sets.
+- **Rows:** a snapshot record that completes a swap emits an `R` row; a diff that completes it
+  emits its own `D` row, showing the post-swap state.
+- If coverage runs out before the swap, §5.3 applies: the shadow is discarded and the pending
+  refresh snapshot becomes the resync's pending snapshot.
+
+### 5.6 depth5 cross-check
+
+depth5 never modifies the book. While Unsynced it is ignored. While Synced, with *p* the depth5
+id:
 
 | Case | Action |
 |---|---|
@@ -338,23 +417,17 @@ A pending check is resolved when the next diff *d* = (`U`, `u`) is applied:
 | `p == u` | **Full check** after applying *d* |
 | `p > u` | Keep pending |
 
-- **Full check**: on each side the book's top levels equal the depth5 levels (same count, prices
-  and quantities).
-- **Partial check**: within depth5's price range on each side, every price not present in *d*
+- **Full check:** on each side the book's best levels equal the depth5 levels (same count,
+  prices and quantities).
+- **Partial check:** within depth5's price range on each side, every price not present in *d*
   has the same presence and quantity in the book and in depth5. Prices not touched by *d* did not
   change between *id* and *u*, so their state at *p* is known exactly.
-- **Match**: counted as `depth5_verified` or `depth5_partially_verified`.
-- **Mismatch**: counted as `depth5_mismatch`; the first 10 are logged with both level sets. The
-  book is repaired by range replace with the depth5 levels.
-
-Why range replace at *p ≥ id* followed by the remaining diffs yields the true book: let *T* be the
-range covered by depth5 at *p*. After the replace, every level in *T* holds its true value at *p*,
-and levels outside *T* hold their value at *id*. The diffs that follow carry the absolute
-quantity of every level that changed after *id*. A level that changed is overwritten with its
-true newer value. A level that did not change keeps a value that was already correct: inside *T*
-its value at *p* equals its current value, and outside *T* its value at *id* does. A level the
-replace removed but which exists later must have changed after *p*, so a following diff restores
-it.
+- Both checks are exact because the book is authoritative whenever it is Synced (§5.3).
+- **Match:** counted as `depth5_verified` or `depth5_partially_verified`.
+- **Mismatch:** counted as `depth5_mismatch`; the first 10 are logged with both level sets. The
+  book has been shown wrong somewhere, possibly below the depth5 range, so it becomes Unsynced and
+  resynchronises from REST (§5.7). No row is emitted for the record whose processing found the
+  mismatch.
 
 Live probe (20 s, BTCUSDT, 2026-10-11):
 
@@ -362,31 +435,49 @@ Live probe (20 s, BTCUSDT, 2026-10-11):
   message before that diff, so the *full check after applying d* path applies.
 - **usdm:** depth5 ids never equalled a diff's `u` (0/130), so the *partial check* path applies.
 
-### 5.5 Gaps, reconnects and errors
+### 5.7 Gaps, reconnects and errors
+
+All state below is per symbol. No event for one symbol changes another symbol's state.
 
 | Situation | Effect |
 |---|---|
-| New `conn_epoch` on a shard (the processor sees an epoch greater than the last one seen for that shard) | Every symbol on the shard becomes Unsynced: book cleared; sync buffer, pending snapshot and pending depth5 check discarded; new snapshot requested. `conn_seq` restarts at 0 |
-| Diff sequence gap while Synced | That symbol becomes Unsynced (book cleared, the gap diff seeds the new buffer, snapshot requested); counted as `gaps` |
+| A record (market-data or snapshot) of the symbol carries a `conn_epoch` greater than the last one the symbol saw | Reset before processing the record: book cleared, window, pending snapshot, pending depth5 check and shadow refresh discarded, state Unsynced, snapshot requested. The record is then processed normally |
+| Diff gap while Synced | Unsynced; the window restarts with the gap diff; snapshot requested; counted as `gaps` |
 | Diff payload parse error | Treated as a gap: a missing diff can't be skipped safely |
 | depth5 or trade payload parse error | Counted; no row; book unchanged |
 | Payload `s` ≠ stream symbol | Parse error (defensive) |
-| Snapshot too old | Discarded and a new one requested (§5.3) |
-| REST request failure | Retried by the network layer with backoff; `418`/`429` honour `Retry-After` |
-| Envelope invalid or stream not subscribed | Counted; no market-data row; its `conn_seq` number stays unused |
+| Coverage exhausted | Unsynced and resync (§5.3) |
+| depth5 mismatch | Unsynced and resync (§5.6) |
+| Snapshot too old or not authoritative | Discarded; a new one is requested (§5.4) |
+| REST request failure | Retried by the scheduler (§6.3) |
+| Envelope invalid, stream not subscribed, or ring full | Counted; no market-data row; its `conn_seq` number stays unused |
 
-The brief's options were "reset, resync, or drop until snapshot". This design resets the book and
-drops order-book output until a REST snapshot resynchronises it, on every new epoch and every gap.
+Epochs are tracked per symbol, not per shard. A symbol has no market-data records between a
+disconnect and its own first record on the new connection, so resetting at that record discards
+no data. A snapshot received after the reconnect carries the new epoch and triggers the reset
+itself. This makes each symbol's output a function of its own records only (§7). A shard-wide
+reset, triggered by whichever symbol's record arrives first, would make a symbol's output depend
+on other symbols' timing, which per-symbol files could not reproduce.
 
-### 5.6 Row emission rules
+The brief's options were "reset, resync, or drop until snapshot". This design resets the book
+and drops order-book output until a REST snapshot resynchronises it, on every new epoch, gap,
+coverage exhaustion and depth5 mismatch.
 
-- Unsynced: no order-book rows.
-- Becoming Synced: exactly one `R` row (the book after the snapshot and the buffered diffs).
-- Synced: exactly one row per successfully parsed market-data record of that symbol — `D`, `P`
-  and `T` (`T` omitted with `--no-trade-rows`) — showing the book after processing the record,
-  including stale diffs and depth5 records that leave the book unchanged.
+### 5.8 Row emission rules
+
+- **Unsynced:** no rows.
+- **Completing a synchronisation** (Unsynced → Synced): exactly one `R` row, timestamped with the
+  record that completed it (§5.4).
+- **While Synced, and still Synced afterwards:** one row per successfully parsed record of the
+  symbol, showing the book after processing it:
+  - market-data records → `D`, `P`, `T` (`T` omitted with `--no-trade-rows`), including stale
+    diffs and depth5 records that leave the book unchanged;
+  - a snapshot record that completes a background refresh → `R`;
+  - any other snapshot record → no row.
+- **A record whose processing makes the book Unsynced** (gap, diff parse error, coverage
+  exhaustion, depth5 mismatch) → no row.
 - Consequently every order-book file starts with an `R` row, and every row shows a book that
-  passed the sequence checks.
+  passed the sequence, coverage and cross-checks.
 
 ## 6. Architecture
 
@@ -396,11 +487,11 @@ drops order-book output until a REST snapshot resynchronises it, on every new ep
  io thread (main thread, Boost.Asio io_context)        processing thread (single consumer)
  ┌────────────────────────────────────────────┐        ┌──────────────────────────────────────────┐
  │ WsShard ×N: resolve→TCP→TLS→WS→read loop    │        │ for each record, in order:               │
- │   recv_ns, conn_seq, envelope split ───────┼─┐      │  1. rotate files if the UTC date changed │
- │ RestClient: HTTPS depth snapshots ─────────┼─┤ SPSC │  2. write market-data / sidecar row      │
+ │   recv_ns, conn_seq, envelope split ───────┼─┐      │  1. per-symbol epoch check (§5.7)        │
+ │ RestScheduler: paced HTTPS snapshots ──────┼─┤ SPSC │  2. write market-data / sidecar row      │
  │ signal_set, --duration, reconnect timers   │ ├─ring─►  3. parse payload once (simdjson)        │
- │                                            │ │      │  4. book: sync state machine (§5)        │
- │ asio::post ◄── snapshot requests, fatal ───┼─┼──────┤  5. write order-book row (§5.6)          │
+ │                                            │ │      │  4. sync / book / cross-check (§5)       │
+ │ asio::post ◄── snapshot requests, fatal ───┼─┼──────┤  5. write order-book row (§5.8)          │
  └────────────────────────────────────────────┘ │      │  periodic: flush (1 s), stats line       │
                                                 │      └──────────────────────────────────────────┘
  replay: CSV reader + sidecar injection ────────┘  (same processor; no io thread, no sockets)
@@ -408,12 +499,12 @@ drops order-book output until a REST snapshot resynchronises it, on every new ep
 
 | Thread | Owns | Never does |
 |---|---|---|
-| io | `io_context`, shards, REST client, signal set, timers; envelope split; ring producer | Payload parsing, book updates, file I/O |
+| io | `io_context`, shards, REST scheduler, signal set, timers; envelope split; ring producer | Payload parsing, book updates, file I/O |
 | processing | Ring consumer, simdjson parser, books, writers, metrics output | Socket I/O |
 
 The threads share exactly three things:
 
-1. The SPSC ring (acquire/release atomics).
+1. The SPSC ring (acquire/release atomics) and its producer-closed flag.
 2. `asio::post` from the processor to the io thread (snapshot requests, fatal-error shutdown).
 3. Relaxed atomic metric counters.
 
@@ -441,85 +532,166 @@ consumer is idle.
   and reassembles fragmented messages, so the processor only ever sees whole messages.
 - **Per frame:** take `recv_ns` and the next `conn_seq`; split the envelope; look up the stream
   name → (symbol index, stream kind) in the shard's table; push the record to the ring.
-- **Envelope split:** a validated byte scan, not a JSON parse. The frame must start with
-  `{"stream":"`, the name ends at the next `"`, which must be followed by `,"data":`; the payload
-  runs from there to the final `}` and must itself start with `{` and end with `}`. A frame that
-  fails the fast path is retried with simdjson On-Demand (`find_field("stream")`,
-  `find_field("data").raw_json()`); if that also fails, the frame is counted as malformed.
+- **Envelope split, fast path:** a validated byte scan, not a JSON parse. The frame must start
+  with `{"stream":"`, the name ends at the next `"`, which must be followed by `,"data":`; the
+  payload runs from there to the final `}` and must itself start with `{` and end with `}`.
+- **Envelope split, fallback:** a frame that fails the fast path (for example `data` before
+  `stream`) is parsed with simdjson On-Demand in a single pass over the envelope's fields,
+  dispatching on the key, so field order does not matter: `stream` must be a string, `data` is
+  captured with `raw_json()`, and each must appear exactly once. Anything else is counted as
+  malformed. A reversed-envelope fixture covers this path.
 - **Reconnect:** any read error, close or timeout schedules a reconnect with backoff (500 ms,
   doubling, capped at 30 s, ±20 % jitter, reset after 60 s connected). This also covers
   Binance's 24-hour disconnect. A successful handshake increments `conn_epoch`. Attempt rates
   stay far below spot's 300 connections per 5 minutes per IP.
-- **REST client:** one session object per request (Beast HTTP over TLS, 10 s timeout, body
-  ≤ 16 MiB, at most 4 concurrent requests). A `200` response is pushed to the ring as a snapshot
-  record (retried on a 10 ms timer if the ring is full). `418`/`429` wait for `Retry-After`
-  (default 60 s); other failures retry with the same backoff as the WebSocket.
 - **`--fault-reconnect-every N`:** a timer force-closes each connection every N seconds.
 
-### 6.3 Record queue (SPSC ring)
+### 6.3 REST snapshot scheduler
 
-- One pre-allocated byte ring (64 MiB) between the io thread and the processor.
+One scheduler per process: a process serves one venue, so all its requests share one IP weight
+budget. Limits verified live on 2026-10-11 via `exchangeInfo` and `X-MBX-USED-WEIGHT-1M`:
+
+| Venue | `REQUEST_WEIGHT` limit | Our budget (50 %) | Snapshot weight (`limit=1000`) |
+|---|---|---|---|
+| spot | 6 000 / min | 3 000 / min | 50 |
+| usdm | 2 400 / min | 1 200 / min | 20 |
+
+- **Pacing:** a token bucket with capacity = budget, refilled at budget / 60 per second. A
+  request is dispatched only when the bucket holds its weight and fewer than 4 requests are in
+  flight. Requests are served FIFO; a symbol has at most one queued or in-flight request.
+- **Reconciliation:** every response's `X-MBX-USED-WEIGHT-1M` is read. If the server-reported
+  usage leaves less than one request's weight below our budget, dispatch pauses until the start
+  of the next minute.
+- **429 / 418:** a global cooldown pauses all dispatch for `Retry-After` seconds (60 s if
+  absent); the failed request is requeued at the head. 418 (IP ban) is also logged as an error.
+  No request is sent during a cooldown.
+- **Transport errors and timeouts** (10 s per request; body ≤ 2 MiB): requeued with per-request
+  backoff (500 ms → 30 s), still subject to the bucket and any cooldown.
+- **Delivery:** a `200` response is pushed to the ring as a snapshot record, stamped with the
+  symbol's shard and current `conn_epoch`. If the ring is full, the push is retried on a 10 ms
+  timer.
+- **Burst cost:** one symbol synchronises immediately. At the 256-symbol limit, initial spot
+  synchronisation needs 12 800 weight, so the last symbols synchronise after about 4 minutes;
+  usdm needs 5 120 weight, also about 4 minutes. The sliding window (§5.4) bounds the memory of
+  symbols waiting their turn.
+
+### 6.4 Record queue (SPSC ring)
+
+- One pre-allocated byte ring of 16 MiB + 256 KiB per symbol (80 MiB at 256 symbols) between the
+  io thread and the processor.
 - Each record is contiguous and 64-byte aligned: a fixed header, the payload, then
   `SIMDJSON_PADDING` bytes so simdjson parses the payload in place. A record that does not fit
   before the end of the buffer is preceded by a wrap marker.
-- Header: record kind (`market`, `snapshot`, `end`), `shard_id`, `conn_epoch`, `conn_seq`,
-  `recv_ns`, `steady_ns` (for the latency metric), symbol index, stream kind, payload length.
-- Head and tail are atomics on separate cache lines, published with release and read with
-  acquire; each side caches the other side's index to avoid cache-line ping-pong.
+- Header: record kind (`market`, `snapshot`), `shard_id`, `conn_epoch`, `conn_seq`, `recv_ns`,
+  `steady_ns` (for the latency metric), symbol index, stream kind, payload length.
+- Positions are monotonically increasing 64-bit counters (capacity a power of two), published
+  with release and read with acquire, on separate cache lines; each side caches the other side's
+  position to avoid cache-line ping-pong.
 - **Consumer wait:** spin briefly, then park on a condition variable with a 50 ms timeout (so
   periodic flushes and stats still run). The producer notifies only when the consumer is parked,
   so the busy path never takes a lock.
 - **Full ring:** the producer drops the newest frame and counts `ring_drops`; it never blocks the
   io thread. The drop is visible as a `conn_seq` gap in the market-data CSV. A dropped diff
-  produces a sequence gap, which the book handles by resyncing (§5.5). At the measured BTCUSDT
-  rate (spot ≈ 7 KiB/s, usdm ≈ 15 KiB/s) 64 MiB covers over an hour of processor stall per
-  symbol.
+  produces a sequence gap, which the book handles by resyncing (§5.7). At the measured BTCUSDT
+  rate (spot ≈ 7 KiB/s, usdm ≈ 15 KiB/s) a single-symbol ring covers about 18 minutes of
+  processor stall.
+- **Why a custom ring:** it gives a hard byte bound and contiguous, padded payloads for in-place
+  parsing. A proven fixed-slot queue (`boost::lockfree::spsc_queue` of slot indices plus a buffer
+  pool) needs per-slot buffers sized for the largest message, or growth that breaks the byte
+  bound.
+- **Risk control:** the ring is the riskiest component. It is the first task of M4, built and
+  tested on its own before anything is wired to it. Its unit tests
+  cover every wrap case, plus a randomised length fuzz and a two-thread stress test run under
+  TSan. If it cannot be made to pass these, the fallback is the `spsc_queue` + pool design, with
+  a per-slot size cap.
 
-### 6.4 Processor
+### 6.5 Processor
 
 For each record, in ring order:
 
-1. On an `end` record: flush, close, print the final summary and exit the thread.
-2. Detect a new `conn_epoch` for the record's shard (§5.5).
-3. Rotate the symbol's files if the record's UTC date is later than the open files' date (§3.1).
-4. Market record: write the market-data row (minify if needed, escape directly into the writer
+1. Apply the per-symbol epoch rule (§5.7).
+2. Market record: write the market-data row (minify if needed, escape directly into the writer
    buffer). Snapshot record: write the sidecar row.
-5. Parse the payload once with the reused simdjson On-Demand parser into a reused typed event:
-   `DepthDiff`, `Depth5` (fixed arrays of 5 levels), `Trade` or `DepthSnapshot`. Fields are read
-   by key, so field order does not matter; unknown fields (`ps`, `st`, `X`, `M`, …) are ignored.
-6. Run the book logic (§5), then emit an order-book row when §5.6 says so.
-7. Release the record.
+3. Parse the payload once into a reused typed event: `DepthDiff`, `Depth5` (fixed arrays of 5
+   levels), `Trade` or `DepthSnapshot`.
+4. Run the sync, book and cross-check logic (§5), then emit an order-book row when §5.8 says so.
+5. Release the record.
+
+**simdjson rules:**
+
+- **Padding:** every payload is parsed in place from storage with at least `SIMDJSON_PADDING`
+  readable bytes after it (ring records reserve them; replay reads into a padded buffer).
+- **Traversal:** one forward pass per document. The object's fields are iterated once and
+  dispatched on the key; unknown fields (`ps`, `st`, `X`, `M`, …) are skipped. `find_field` is
+  never used, because it only searches forward and would make parsing depend on field order.
+- **Validation:** On-Demand validates only what it visits, so every field is visited. Required
+  fields must appear exactly once with the expected types, levels must be arrays of exactly two
+  strings, and the document must be fully consumed (`at_end()`). Any simdjson error is a parse
+  error.
+- **Ownership:** decoded values are copied into owned integers (events, window, pending
+  snapshot, pending depth5 check) before the record is released. No `string_view`,
+  `ondemand::value` or document outlives the record it came from; the parser is reused for the
+  next record.
 
 The processor owns no timers. Periodic work (flush every 1 s, stats every `--stats-interval`) is
 checked against a steady clock between records and on park timeouts; none of it affects output.
 
-### 6.5 Writers and back-pressure
+### 6.6 Writers and back-pressure
 
-- Each output file has a 1 MiB user-space buffer over an unbuffered `std::FILE` (RAII handle).
+- Market-data and order-book files each have a 64 KiB user-space buffer over an unbuffered
+  `std::FILE` (RAII handle). Sidecar rows (rare, about 60 KB each) are written straight through.
   Rows are formatted with `std::to_chars` straight into the buffer: no temporary strings.
-- The buffer is flushed when full, every 1 s, on rotation and on shutdown. `fsync` is not used,
-  so a crash loses at most about the last second.
-- A short or failed write is fatal: logged, counted, and the processor posts a shutdown with
-  exit code 1.
+- Buffers are flushed when full, every 1 s, and at shutdown.
+- The result of every write, `fflush` and `fclose` is checked. Any failure is fatal (§6.7) and
+  the exit code is 1.
+- **Durability:** a flush hands data to the operating system; `fsync` is not used. A process
+  crash loses at most the last second of unflushed rows. An operating-system crash or power loss
+  can lose more, since data in the page cache is not guaranteed durable.
 - **Back-pressure chain:** disk stall → processor stalls → the ring absorbs it → if the ring
-  fills, frames are dropped and counted (§6.3). The socket thread never waits on disk.
+  fills, frames are dropped and counted (§6.4). The socket thread never waits on disk.
 - A dedicated writer thread was rejected: formatting is the dominant cost and stays on the
-  processor, and 1 MiB writes already amortise system calls. The ring already decouples the
+  processor, and buffered writes already amortise system calls. The ring already decouples the
   socket from disk. The benchmark (§10) records the processor's per-record cost to back this up.
 
-### 6.6 Shutdown
+### 6.7 Shutdown protocol
 
-1. **Trigger:** SIGINT/SIGTERM (`asio::signal_set`), the `--duration` timer, or a fatal error
-   posted by the processor.
-2. **io thread:** mark stopping; cancel timers and REST sessions; `async_close` each WebSocket
-   (2 s timeout); push an `end` record (retrying until there is space); return from
-   `io_context::run()`.
-3. **Processor:** drain the ring up to `end`, flush and close every file, print the final
-   summary.
-4. **main:** join the processor and return the exit code.
+State:
 
-A second SIGINT/SIGTERM stops the `io_context` immediately; the processor still drains and
-flushes. All resources are RAII-owned, so a normal exit is clean under ASan, LSan and Valgrind.
+- `stopping` — io thread only.
+- The ring's `producer_closed` flag — atomic.
+- `fatal` — processor only.
+- The exit code — atomic.
+
+Steps:
+
+1. **First trigger** (SIGINT/SIGTERM, the `--duration` timer, or a fatal error posted by the
+   processor) runs `begin_shutdown()` on the io thread:
+   - set `stopping`;
+   - cancel timers;
+   - the scheduler stops dispatching and cancels in-flight requests;
+   - every shard starts `async_close` with a 2 s timeout, and no reconnect is scheduled;
+   - a 3 s deadline timer calls `io_context::stop()` if anything hangs.
+
+   A read that completes after `stopping` was set may still push its record: that data was
+   received and is kept.
+2. **Second SIGINT/SIGTERM** calls `io_context::stop()` immediately.
+3. **Closing production:** when `io_context::run()` returns (either way), no io handler can run
+   again. main then calls `ring.close_producer()` (release store plus notify). This is the only
+   termination signal. It needs no ring space, so a full ring cannot delay it, and nothing can
+   push after it because only io handlers push.
+4. **Consumer termination:** the processor pops until the ring is empty. When empty, it checks
+   `producer_closed` (acquire); if set, it drains once more and finishes. Every record pushed
+   before the close is processed.
+5. **Processor finish:** flush and close every file (results checked), print the final summary,
+   exit the thread.
+6. **Teardown:** main joins the processor, releases its shard and scheduler references, and
+   destroys the `io_context`, which destroys any handlers that never ran and with them the last
+   `shared_ptr`s. The exit code is 1 if the processor hit a fatal error or any close failed, 2
+   for usage errors, otherwise 0.
+
+**Writer failure:** the processor sets `fatal`, stops writing (later records are drained and
+discarded), and posts `begin_shutdown` with exit code 1. `asio::post` is thread-safe; a post that
+arrives after `run()` returned is destroyed without running, which is harmless.
 
 ## 7. Replay mode and determinism
 
@@ -527,59 +699,97 @@ flushes. All resources are RAII-owned, so a normal exit is clean under ASan, LSa
 binance_capture --replay output/market_data_spot_BTCUSDT_2026-10-11.csv --output-dir replay_output
 ```
 
-- Input files are processed in the order given. Book state, `seqNo` and per-shard epoch tracking
-  persist across files, so passing a symbol's daily files in date order reproduces a multi-day
-  capture.
+- Each input file is replayed independently, with fresh processor state and `seqNo` from 0: a
+  file is one run of one symbol (§3.1). Files of different symbols or runs may be given in any
+  order.
 - Each file's header must match §3.3 exactly. Rows are parsed by an RFC 4180 reader (quoted
   fields, `""`, embedded separators/newlines, LF or CRLF) into the same record structure the ring
   carries.
-- The sidecar `depth_snapshots_<venue>_<SYMBOL>_<date>.csv` must be in the same directory as each
-  market-data file. Each snapshot row is injected immediately before market-data row
-  `apply_before_row`. A missing sidecar is an error (the book could never synchronise).
+- The sidecar `depth_snapshots_<venue>_<SYMBOL>_<date>.csv` must be in the same directory. Each
+  of its rows is injected immediately before market-data row `apply_before_row`, carrying its
+  `shard_id` and `conn_epoch`. A missing sidecar is an error (the book could never synchronise).
 - Records feed the **same processor**, with the market-data and sidecar writers disabled and a
-  no-op snapshot-request sink.
+  no-op `SnapshotRequester`.
 - Replay never constructs an `io_context`, socket or TLS context. CI verifies this with
   `strace -f -e trace=socket` (no `socket()` calls).
 
-**Determinism argument.** Order-book output is a pure function of the record sequence: the book
-logic has no timers, randomness or I/O-dependent branches, and the snapshot-request bookkeeping
-cannot change output. The market-data CSV stores records in processing order, and the sidecar
-stores each snapshot's position, so replay feeds the identical sequence and produces
-byte-identical order-book files. CI enforces this on the committed sample run with `cmp` (live
-order book vs replay order book). Both runs must use the same `--no-trade-rows` setting.
+**Determinism argument.**
+
+- Processor state is partitioned by symbol: epoch tracking, window, book, coverage, pending
+  checks, `seqNo` and files are all per symbol, and nothing reads another symbol's state.
+- Within a symbol, the logic has no timers, randomness or I/O-dependent branches, and
+  snapshot-request bookkeeping cannot change output.
+- A symbol's order-book output is therefore a pure function of its own ordered record sequence:
+  its market-data records plus its snapshot records.
+- The market-data file stores those records in processing order, and `apply_before_row` places
+  each snapshot record exactly. Replay rebuilds the identical sequence and so produces
+  byte-identical order-book files.
+- CI enforces this on the committed sample run with `cmp`. Both runs must use the same
+  `--no-trade-rows` setting.
+
+**What this proves, and what it does not.** Live = replay proves the two executions are
+consistent, not that the book is correct. Correctness evidence comes from independent sources:
+
+- hand-derived expected outputs and the exchange-simulator property test (§13);
+- the live depth5 cross-check against Binance's own top 5 (§5.6).
 
 ## 8. Observability
 
-- **io-thread counters** (relaxed atomics): frames and bytes received per stream kind,
-  `malformed_frames`, `ring_drops`, `connects`, `reconnects`, `connect_failures`,
-  `rest_requests`, `rest_failures`, `rest_throttled`.
-- **Processor counters:** `md_rows`, `ob_rows`, `snapshot_rows`, `parse_errors`, `stale_diffs`,
-  `gaps`, `resyncs`, `syncs`, `buffer_resets`, `buffer_overflows`, `depth5_verified`,
-  `depth5_partially_verified`, `depth5_mismatch`, `depth5_stale`, `depth5_unchecked`,
-  `payloads_minified`, `ring_high_water`, and a fixed-bucket log2 histogram of receive →
-  row-written latency (steady clock).
+- **io-thread counters** (relaxed atomics):
+  - frames and bytes received per stream kind, `malformed_frames`, `ring_drops`;
+  - `connects`, `reconnects`, `connect_failures`;
+  - `rest_requests`, `rest_failures`, `rest_cooldowns`, `rest_weight_used`.
+- **Processor counters:**
+  - rows: `md_rows`, `ob_rows`, `snapshot_rows`;
+  - sequencing: `parse_errors`, `stale_diffs`, `gaps`, `window_resets`, `window_trimmed`,
+    `syncs`, `resyncs`, `snapshot_too_old`, `coverage_exhausted`;
+  - refresh: `refresh_ok`, `refresh_mismatch`;
+  - depth5: `depth5_verified`, `depth5_partially_verified`, `depth5_mismatch`, `depth5_stale`,
+    `depth5_unchecked`;
+  - other: `payloads_minified`, `ring_high_water`, `retained_bytes` (capacity of all
+    per-symbol containers plus fixed buffers);
+  - a fixed-bucket log2 histogram of receive → row-written latency (steady clock).
 - **Stats line** on stderr every `--stats-interval` seconds, `key=value` for `grep`/`awk`:
   `stats uptime_s=10 frames=394 md_rows=394 ob_rows=377 parse_errors=0 gaps=0 resyncs=0
-  reconnects=0 depth5_verified=187 depth5_mismatch=0 ring_drops=0 ring_hw_kib=12 lat_p50_us=4
-  lat_p99_us=21`
-- **Final summary** at exit: the same counters, totals and per symbol.
+  reconnects=0 coverage_exhausted=0 depth5_verified=187 depth5_mismatch=0 ring_drops=0
+  ring_hw_kib=12 retained_kib=1830 lat_p50_us=4 lat_p99_us=21`
+- **Final summary** at exit: the same counters, totals and per symbol, plus peak RSS (`VmHWM`
+  from `/proc/self/status`).
 - **Logging:** stderr, levels `info`/`warn`/`error`, ISO-8601 UTC timestamps. Repeated errors
   are rate-limited (first 10, then every 1000th). Nothing is logged per message on the normal
   path.
 
-## 9. Limits and security
+## 9. Limits, memory budget and security
 
 | Limit | Value | On violation |
 |---|---|---|
 | Symbols per process | 256 | Usage error |
-| Symbols per connection | spot 341, usdm 66 | Usage error |
-| Stream URL length | 8 192 bytes | Usage error |
+| Streams per connection | spot 1 024 (341 symbols); usdm 200 (66 symbols) — §15 | Usage error |
+| Stream URL length | 8 192 bytes (often the binding limit: ≈ 94 bytes per 20-character symbol) | Usage error |
 | WebSocket message | 4 MiB | Frame rejected (Beast error) → reconnect, counted |
-| REST body | 16 MiB | Request failed → retry, counted |
-| Ring | 64 MiB | Newest frame dropped, counted |
-| Sync buffer | 10 000 diffs per symbol | Buffer reset, counted |
-| Book side | 20 000 levels | Trimmed to 15 000 worst-first |
-| Concurrent REST requests | 4 | Queued |
+| REST body | 2 MiB (a `limit=1000` snapshot is ≈ 64 KB spot, ≈ 42 KB usdm) | Request failed → retry, counted |
+| Recent-diff window | 20 000 levels / 2 000 diffs per symbol | Oldest dropped, counted |
+| Book side | 5 000 levels | Trimmed to 4 000, coverage adjusted |
+| Concurrent REST requests | 4, plus weight pacing (§6.3) | Queued |
+
+**Memory budget** (retained capacity; reused containers keep their capacity, so these are the
+steady-state maxima):
+
+| Item | Per symbol | Fixed |
+|---|---|---|
+| Ring | 256 KiB | 16 MiB |
+| simdjson parser (capacity 4 MiB, ≈ 5× capacity) | — | ≈ 20 MiB |
+| Event scratch (diff levels; grows only to the largest message seen) | — | ≤ 4 MiB |
+| Writer buffers (2 × 64 KiB) | 128 KiB | — |
+| Book, 2 sides × 5 000 levels × 16 B (twice during a refresh) | ≤ 320 KiB | — |
+| Recent-diff window (20 000 levels × 16 B + headers) | ≤ 360 KiB | — |
+| **Total** | **≤ ~1.1 MiB** | **≈ 40 MiB** |
+
+That is about 41 MiB for one symbol and about 320 MiB at the 256-symbol limit. The
+`retained_bytes` gauge and the peak-RSS figure in the final summary check these numbers in the
+live smoke test.
+
+**Security:**
 
 - Only public, unauthenticated endpoints are used, so no credentials are needed. There is no
   config file and no environment variable is read.
@@ -590,24 +800,27 @@ order book vs replay order book). Both runs must use the same `--no-trade-rows` 
 ## 10. Performance and allocation strategy
 
 - **JSON:** simdjson On-Demand. Each payload is parsed exactly once, on the processor; envelope
-  splitting is a bounded byte scan. Levels are read with `get_raw_json_string()` (prices contain
-  no escapes) straight into the decimal parser.
-- **Steady-state allocations: zero per message.** Everything is allocated once and reused:
-  - the ring (once at startup);
-  - the simdjson parser (allocated for the maximum document size);
-  - typed events (`std::vector` levels keep their capacity; depth5 uses fixed arrays);
-  - book sides (reserved);
-  - the sync buffer (reused `DepthDiff` slots);
-  - writer buffers;
-  - the Beast `flat_buffer`.
-
-  Formatting uses `std::to_chars`. A unit test replaces global `operator new`/`delete` with
-  counting versions, replays recorded traffic after a warm-up, and asserts the count is 0.
+  splitting is a bounded byte scan (§6.2). Levels are read with `get_raw_json_string()` (prices
+  contain no escapes) straight into the decimal parser.
+- **Zero heap allocations per record — scope of the claim:**
+  - **Covered:** the processor's per-record path for a Synced symbol after warm-up — payload
+    parse, sequence classification, window append, book update, depth5 check, row formatting and
+    the buffered write.
+  - **Not covered:**
+    - the network path: our buffers there (Beast `flat_buffer`, ring) are reused, but Asio,
+      Beast and OpenSSL may allocate internally;
+    - synchronisation, resync and refresh transitions, where loading a snapshot may grow book
+      storage up to the snapshot size;
+    - startup, file creation and shutdown.
+  - **Proof:** a unit test replaces global `operator new`/`delete` with counting versions, replays
+    recorded traffic through the processor after a warm-up, and asserts the count stays 0 for the
+    covered path.
 - **Benchmarks** (`bench/`, off by default, plain `std::chrono` harness with repetitions and
   percentiles):
   - decimal parsing;
   - payload parsing per stream kind;
-  - book updates, flat vector vs `std::map`, with near-touch and deep update mixes;
+  - book updates, flat vector vs `std::map`, with near-touch updates, deep updates, near-touch
+    deletions and deep deletions;
   - ring push/pop;
   - end-to-end replay throughput (records/s) and per-record latency p50/p99/p99.9.
 
@@ -626,17 +839,19 @@ src/
     csv/                   schema.hpp (exact headers, column counts), csv_writer.{hpp,cpp},
                            csv_reader.{hpp,cpp}
     parse/                 events.hpp, envelope.{hpp,cpp}, payload_parser.{hpp,cpp}
-    book/                  book_side.hpp, order_book.{hpp,cpp}, sync.{hpp,cpp},
+    book/                  book_side.hpp, order_book.{hpp,cpp} (incl. coverage),
+                           sequence.{hpp,cpp}, diff_window.{hpp,cpp}, sync.{hpp,cpp},
                            depth5_check.{hpp,cpp}
     pipeline/              record.hpp, spsc_ring.hpp, processor.{hpp,cpp},
-                           output_files.{hpp,cpp}, metrics.{hpp,cpp}
+                           output_files.{hpp,cpp}, snapshot_requester.hpp, metrics.{hpp,cpp}
     replay/                replay_source.{hpp,cpp}
     net/                   endpoints.{hpp,cpp}, tls.{hpp,cpp}, ws_shard.{hpp,cpp},
-                           rest_client.{hpp,cpp}, capture_app.{hpp,cpp}
+                           rest_scheduler.{hpp,cpp}, capture_app.{hpp,cpp}
     cli/                   options.{hpp,cpp}
     util/                  logging.{hpp,cpp}
 third_party/simdjson/      simdjson.h, simdjson.cpp, LICENSE, VERSION (pinned release)
-tests/                     one test file per module, fixtures/ (real captured payloads)
+tests/                     one test file per module; fixtures/ (real captured payloads);
+                           scenarios/ (hand-built inputs with hand-derived expected outputs)
 bench/                     blc_bench (BLC_BUILD_BENCH=OFF by default)
 scripts/                   verify_outputs.sh, reviewer_checklist.sh, live_smoke.sh
 samples/                   committed 1–2 minute capture + order book (S2)
@@ -652,7 +867,7 @@ docs/                      design.md, requirements.md
 | `blc_bench` | `bench/` | `blc_core` |
 
 Keeping Boost out of `blc_core` keeps the book, CSV and replay logic independent of the network
-stack. The processor reaches the network only through a small `SnapshotRequester` interface:
+stack. The processor reaches the network only through the `SnapshotRequester` interface:
 `blc_net` implements it with `asio::post`, and replay passes a no-op implementation.
 
 ## 12. Toolchain, dependencies and CI
@@ -667,46 +882,62 @@ stack. The processor reaches the network only through a small `SnapshotRequester
 |---|---|---|
 | Boost (Asio, Beast) | ≥ 1.74 (jammy) | `libboost-all-dev`; header-only use |
 | OpenSSL | ≥ 1.1.1 (jammy: 3.0) | `libssl-dev` |
-| simdjson | 4.6.11, recorded in `third_party/simdjson/VERSION` (latest of the mature 4.x line; 5.0 shipped 2026-09-28 and is still taking patch releases) | Vendored single-header amalgamation, so the main build needs no network |
+| simdjson | 4.6.11, recorded in `third_party/simdjson/VERSION` (latest of the mature 4.x line; 5.0 shipped 2026-09-28 and is still taking patch releases) | Vendored single-header amalgamation |
 | GoogleTest | 1.17.0 | CMake `FetchContent`, URL + SHA-256 pinned, tests only |
 | zlib | jammy | Listed in the brief's package list; not linked (Binance does not negotiate `permessage-deflate`) |
 
-- **CI** (GitHub Actions, every job in an `ubuntu:22.04` container with the README package list):
+- **Network during the build:** the `binance_capture` target needs none. The default configure
+  does download GoogleTest, because tests are enabled by default (the reviewer checklist builds
+  them). For a fully offline build, configure with `-DBLC_BUILD_TESTS=OFF`, or with
+  `-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=<local copy>`.
+- **CI** (GitHub Actions, every job in an `ubuntu:22.04` container with the README package list).
+  Each gate is added together with the module it checks:
 
-| Job | Checks |
-|---|---|
-| gcc-12 / clang-15 Release | `-Werror` build, unit tests via the README commands |
-| Reviewer clean build | Bare `cmake -B build && cmake --build build` |
-| ASan + UBSan | Debug build: unit tests + replay of `samples/` |
-| TSan | Unit tests (including a ring stress test) + replay |
-| Valgrind | memcheck on replay of `samples/`, zero errors and leaks |
-| clang-tidy, clang-format | `.clang-tidy`, `.clang-format` clean |
-| Output contract | Replay `samples/` → `cmp` against the committed order book; exact headers; 26 columns; CSV validator; `strace` shows no sockets in replay; secrets grep empty |
+| Job | Checks | Status |
+|---|---|---|
+| gcc-12 / clang-15 Release | `-Werror` build, unit tests via the README commands | Exists (M0) |
+| Reviewer clean build | Bare `cmake -B build && cmake --build build` | Exists (M0) |
+| clang-format | Formatting clean | Added in M1 |
+| ASan + UBSan | Debug build: unit tests (+ replay of `samples/` from M8) | Added in M1 |
+| TSan | Unit tests, including the ring stress test | Added with the ring (M4) |
+| Output contract | Replay of scenario fixtures and `samples/` → `cmp` against expected files; exact headers; 26 columns; CSV validator; `strace` shows no sockets in replay; secrets grep empty | Scenario part with replay (M4); samples part in M8 |
+| Valgrind | memcheck on replay, zero errors and leaks | Added with replay (M4) |
+| clang-tidy | `.clang-tidy` clean | Added in M6 |
 
   Live capture is not run in CI: Binance blocks the US IPs GitHub runners use. Live checks run
   locally via `scripts/live_smoke.sh`.
 
 ## 13. Testing strategy
 
+Two kinds of evidence are kept separate. **Consistency tests** (live = replay, golden files
+produced by the program) catch regressions. **Correctness tests** compare against expected
+results derived independently of the code under test.
+
 | Suite | Covers |
 |---|---|
 | `decimal` | Table of valid/invalid inputs, exactness, 8-decimal boundary, overflow boundary, no floats |
 | `csv_writer` / `csv_reader` | Quoting rules, `""` escaping, embedded comma/quote/newline, exact headers, round-trip, LF/CRLF input |
-| `schema` | Header strings byte-exact, 26 / 9 / 6 column counts |
+| `schema` | Header strings byte-exact, 26 / 9 / 8 column counts |
 | `time`, `instrument_id` | ns split incl. boundaries; FNV values from §4.3 |
 | `options` | Every flag, defaults, `=` form, all validation errors, symbol normalisation, exit code 2 |
-| `endpoints` | URL building per venue, lowercase stream names, sharding, URL-length limit |
-| `envelope` | Fast path, fallback path, malformed frames, unknown streams |
-| `payload_parser` | Real spot/usdm diff, depth5, trade and REST fixtures; field order independence; symbol mismatch; bad decimals |
-| `book_side` | Insert/update/erase at top, middle and bottom; erase-absent no-op; ordering; top-5 with < 5 levels; trimming |
-| `order_book` property test | 10⁶ random operations vs a `std::map` reference model; top-5 equal after every step |
-| `sync` | Spot and usdm: happy path, stale buffered diffs, snapshot too old → refetch, bridge conditions at exact boundaries, gap while Synced, buffer reset on discontinuity, buffer overflow, epoch change, parse-error-as-gap |
-| `depth5_check` | All four resolution cases, full/partial match and mismatch, repair correctness (replace then diffs = truth), stale and unchecked counting |
-| `processor` | Row emission rules (§5.6), `type`/`side` mapping, `--no-trade-rows`, rotation at UTC midnight, `seqNo` continuity, sidecar `apply_before_row` |
-| `replay` | Golden files: fixture capture → replay → byte-equal expected order book; sidecar injection; header validation errors |
-| `spsc_ring` | Wrap-around, padding, full-ring drop, multi-threaded stress (run under TSan) |
-| `allocations` | Zero heap allocations per record in steady state |
-| `live_smoke.sh` (local) | 60 s live capture per venue; `verify_outputs.sh`; replay → `cmp` |
+| `endpoints` | URL building per venue, lowercase stream names, sharding, stream and URL-length caps |
+| `envelope` | Fast path, reversed-field fallback, duplicate/missing keys, malformed frames, unknown streams |
+| `payload_parser` | Real spot/usdm diff, depth5, trade and REST fixtures; field-order independence; missing/duplicate fields; trailing content; symbol mismatch; bad decimals |
+| `book_side` | Insert/update/erase at top, middle and bottom; erase-absent no-op; ordering; trimming |
+| `sequence` | Stale / gap / continues for both venues at every boundary, including spot overlap (`[100,105]` then `[103,108]`) |
+| `diff_window` | Append, stale skip, reset on gap, oldest-first trimming by levels and by count, wrap-around |
+| `sync` | Both venues: snapshot older/newer than the window, bridge conditions at exact boundaries, sync completed by a later diff (timestamp of that diff), too-old refetch, epoch reset, parse error as gap |
+| `coverage` | Complete vs bounded sides, margin, exhaustion → Unsynced, trimming moves the boundary |
+| `depth5_check` | All four resolution cases; full and partial match; mismatch → Unsynced; stale and unchecked counting |
+| `refresh` | Shadow sync from the window, snapshot newer than the book, too-old refetch, swap with equal and different top 5, exhaustion during refresh |
+| `processor` | Row emission rules (§5.8), `type`/`side` mapping, `--no-trade-rows`, sidecar `apply_before_row`, per-symbol epoch isolation |
+| `spsc_ring` | Every wrap case, padding, full-ring drop, close protocol, randomised length fuzz, two-thread stress (run under TSan) |
+| `shutdown` | Close with an empty ring, a full ring, a second signal, and a writer failure: the consumer always terminates and drains |
+| `allocations` | Zero heap allocations on the covered path (§10) |
+| **Exchange simulator** (property test) | A reference "exchange" holds a full-depth book and generates random activity: diffs, depth5, trades, REST snapshots truncated to 1 000 levels, reconnects. The output is fed through the processor. Every emitted row must equal the simulator's true top 5 at that point, and output may be suppressed only when the rules require it. 10⁵+ steps across seeds, both venues |
+| **Scenario fixtures** | Small hand-written market-data + sidecar files with hand-derived expected order-book CSVs: initial sync with overlap, spot/usdm bridge boundaries, gap → resync, two symbols on one shard across a reconnect (each replayed alone), coverage exhaustion, depth5 mismatch → resync, sync completed by a later diff, reversed envelope, trade side mapping |
+| **Consistency** | Golden-file replay of captured fixtures; live → replay `cmp` on `samples/` |
+| `live_smoke.sh` (local) | 60 s live capture per venue; `verify_outputs.sh`; replay → `cmp`; `depth5_mismatch=0`; peak RSS within budget |
 
 TDD applies: each module's tests are written before its implementation.
 
@@ -715,29 +946,40 @@ TDD applies: each module's tests are written before its implementation.
 | Decision | Chosen | Rejected because |
 |---|---|---|
 | Book synchronisation | REST snapshot + buffered diffs (official procedure, X1) | A depth5-seeded diff book shows holes when a top level is removed and level 6 was never seen |
-| depth5 role | Exact cross-check; range replace only to repair | Replacing on every arrival would make the check circular; merging depth5 like a diff is wrong (no `qty 0` for levels leaving the top 5) |
+| Finite snapshot depth | Coverage boundary; exhaustion → resync; background refresh (enhancement) renews it early | Ignoring it emits wrong top-5 rows after the price moves beyond the snapshot (≈ 0.15–0.24 % for BTCUSDT) |
+| depth5 role | Exact cross-check only; mismatch → REST resync | Patching the book from depth5 leaves levels below its range untrusted; merging depth5 like a diff is wrong (no `qty 0` for levels leaving the top 5) |
 | Trades | Annotation rows, book unchanged | Applying fills would double-count the diff stream |
+| Epoch reset | Per symbol, at its first record with a newer epoch | A shard-wide reset makes a symbol's output depend on other symbols' timing and breaks per-file replay |
+| Files | Per symbol, one set per run, named by the run's UTC start date | Daily rotation makes later files depend on earlier ones (no starting snapshot) and complicates replay |
+| Existing output files | Renamed aside (`.replaced-<timestamp>`) | Truncating destroys earlier captures; refusing breaks the brief's README sequence, which reuses `./output` |
+| REST usage | Weighted token bucket at 50 % of the IP budget, header reconciliation, global cooldown | Concurrency limits alone exceed the budget at scale; per-request `Retry-After` lets other requests continue during a cooldown |
 | Threading | io thread + processor over an SPSC ring | One thread lets disk stalls block the socket; a writer thread adds a hop with no measured benefit |
+| Queue | Custom byte ring, built first under heavy tests | `spsc_queue` + pool lacks a hard byte bound (kept as fallback) |
 | Ring full | Drop newest, counted, visible as `conn_seq` gap | Blocking stalls every connection and their pings, and loses more data through disconnects |
-| Book structure | Sorted flat vector, best at back | `std::map` allocates per insert and chases pointers; a price-indexed ladder needs tick sizes and wide ranges |
+| Book structure | Sorted flat vector, best at back, galloping search | `std::map` allocates per insert and chases pointers; a price-indexed ladder needs tick sizes and wide ranges |
 | JSON | simdjson On-Demand (vendored) | Boost.JSON requires Boost 1.75 (jammy has 1.74); RapidJSON/nlohmann are slower or allocate per value |
 | WebSocket/TLS | Boost.Beast + OpenSSL | Already in the brief's package list; websocketpp is unmaintained; libwebsockets is C-callback based |
-| Files | Per symbol per UTC date, rotation at midnight | One multi-symbol file per run mixes independent books and breaks per-file replay |
 | Timestamps | Receive wall clock | Spot depth5 has no event time |
 | Instrument id | Hash of venue:symbol | An index into `--symbols` changes with argument order and breaks live = replay |
 | CSV line ending | LF | CRLF is RFC-literal but hostile to Unix tools; documented and the reader accepts both |
-| Exchange-side resync after reconnect | Always resync via REST | Attempting to continue the sequence across connections saves one request but adds a rarely exercised path |
+| Resync after reconnect | Always via REST | Continuing the sequence across connections saves one request but adds a rarely exercised path |
 
-## 15. Verify during implementation
+## 15. Verification status
 
-These defaults are set; each must be confirmed and the constant or this document updated.
+**Resolved:**
 
-1. **usdm streams per connection:** the cap is assumed to be 200 (→ 66 symbols). Confirm in the
-   USD-M docs; adjust `kMaxStreamsPerConnection` per venue.
-2. **REST weights:** spot `limit=1000` is weight 50, usdm `limit=1000` is weight 20 — confirm,
-   and keep sync bursts after a reconnect well under the per-minute IP limit.
-3. **depth5 consistency live:** `depth5_mismatch` must be 0 over a 10-minute capture per venue
-   (spot full checks, usdm partial checks). Any mismatch is investigated before the repair policy
-   is kept.
-4. **US IP block:** confirm GitHub-hosted runners receive HTTP 451 from Binance; if they do not, a
-   live smoke job is added to CI.
+1. **Streams per connection.** Binance's documentation conflicts: the USD-M market-streams page
+   states 1 024 streams per connection, while the USD-M "Connect" page states 200 (as do the
+   COIN-M and options docs). usdm is capped at the stricter 200, spot at 1 024. In practice the
+   8 192-byte URL limit binds first at around 87 symbols.
+2. **REST weights and limits.** Measured on 2026-10-11 (§6.3).
+3. **Snapshot coverage.** Measured on 2026-10-11 (§5.3).
+
+**Checked during live testing (M5 / M8):**
+
+1. **depth5 consistency:** `depth5_mismatch` must be 0 over a 10-minute capture per venue (spot
+   full checks, usdm partial checks). Any mismatch is investigated before submission.
+2. **Coverage:** count `coverage_exhausted` and `refresh_ok` over a 30-minute capture, and
+   record the result in the README.
+3. **US IP block:** confirm GitHub-hosted runners receive HTTP 451 from Binance; if they do not,
+   a live smoke job is added to CI.

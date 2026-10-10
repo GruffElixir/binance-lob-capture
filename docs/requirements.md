@@ -2,7 +2,14 @@
 
 Every requirement from the assignment brief, with the evidence that proves it is met.
 `Status` moves from **Planned** → **Done** only when the evidence exists (test, CI job, or
-README section). Nothing ships while a row is still **Planned**.
+README section).
+
+Release gate for the `v1.0.0` tag:
+
+- **Functional, Submission and Review focus** rows are mandatory: all must be **Done**.
+- **Optional stretch** rows must be **Done** or marked **Deferred** with a reason.
+- Enhancements chosen in the design (marked "(enhancement)" in [design.md](design.md)) are not
+  submission gates.
 
 ## Exact contracts
 
@@ -44,8 +51,8 @@ Subscriptions per symbol (lowercase in the URL): `<symbol>@depth@100ms`, `<symbo
 | F12 | Order-book timestamp policy documented (same source as market row) | README; replay equality test | Planned |
 | F13 | Fixed price/qty scale documented, applied deterministically; no binary floating point in CSV integer columns | Decimal parser tests (exactness, overflow, rejection) | Planned |
 | F14 | Reconnect/gap behaviour documented: `conn_epoch` and `U`/`u`/`pu` effects (reset/resync/drop) | Book state-machine tests; README | Planned |
-| F15 | Diff semantics: absolute quantities, qty 0 removes level; top-5 correct | Book unit + randomized tests vs reference model; depth5 cross-check metric | Planned |
-| F16 | Output reproducible from fixed input | Replay determinism test: live output == replay output byte-for-byte | Planned |
+| F15 | Diff semantics: absolute quantities, qty 0 removes level; top-5 correct | Book unit tests; exchange-simulator property test (rows equal the true top 5, including snapshot-coverage limits); hand-derived scenario fixtures; live depth5 cross-check metric | Planned |
+| F16 | Output reproducible from fixed input | Replay determinism test: live output == replay output byte-for-byte (consistency); scenario fixtures with hand-derived expected output (correctness) | Planned |
 
 ## Submission
 

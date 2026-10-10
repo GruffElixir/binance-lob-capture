@@ -22,6 +22,8 @@ Testing/
 # --- Run outputs ------------------------------------------------------------
 output/
 replay_output/
+# Earlier outputs moved aside when a run reuses a file name (see docs/design.md §3.1)
+*.replaced-*
 *.log
 perf.data*
 callgrind.out.*
