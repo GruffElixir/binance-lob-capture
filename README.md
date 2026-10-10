@@ -6,7 +6,8 @@ row to an order-book CSV after every processed event. A replay mode rebuilds the
 from a saved capture with no network access.
 
 > **Status:** under active development. Build, run, and design documentation will be completed
-> for the `v1.0.0` submission tag. The full requirement list and how each item is verified is in
+> for the `v1.0.0` submission tag. The specification is [docs/design.md](docs/design.md); the
+> full requirement list and how each item is verified is in
 > [docs/requirements.md](docs/requirements.md).
 
 ## Toolchain
