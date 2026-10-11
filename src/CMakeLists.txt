@@ -19,6 +19,7 @@ add_library(blc_core STATIC
     blc/parse/payload_parser.cpp
     blc/parse/stream_table.cpp
     blc/pipeline/frame_router.cpp
+    blc/pipeline/output_files.cpp
     blc/pipeline/spsc_ring.cpp
     blc/util/logging.cpp)
 target_include_directories(blc_core PUBLIC
