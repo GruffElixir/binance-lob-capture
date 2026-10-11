@@ -76,7 +76,14 @@ Capture writes three files per symbol:
   rotated: a capture that crosses UTC midnight stays in the files named after its start date. A
   run's files are therefore self-contained: each can be replayed on its own, and each order-book
   file starts with an `R` row.
-- All files for all configured symbols are created at startup, with their header rows.
+- **Startup order:**
+  1. parse and validate options;
+  2. validate the symbols against Binance (§6.3);
+  3. archive existing files and create new ones;
+  4. open connections.
+
+  A run that fails steps 1–2 (exit 2) therefore never touches existing files. All files for
+  all configured symbols are created in step 3, with their header rows.
 - The sidecar deliberately does not match the `market_data_*.csv` or `*_orderbook.csv` globs.
 - **Existing files are never overwritten and never cause an error.** If any of a symbol's three
   files already exists, every existing file of that symbol is moved, keeping its name, into one
@@ -128,7 +135,9 @@ recv_tsec,recv_tnsec,venue,stream_kind,shard_id,conn_epoch,conn_seq,symbol,paylo
   order: the processor writes the row before parsing the payload or touching the book.
 - `payload_json` is the received bytes of the `data` value. Binance sends compact JSON (no frame
   in the probe contained whitespace); if a payload ever contains whitespace bytes it is minified
-  with `simdjson::minify` before writing, and counted.
+  with `simdjson::minify` before writing, and counted. The output goes into a processor-wide
+  1 MiB scratch buffer reserved at startup: the payload limit (§9) bounds it, and minified
+  output is never longer than its input.
 
 Example (spot trade from the live probe; `recv_tnsec` and `conn_seq` illustrative):
 
@@ -374,8 +383,13 @@ not, the snapshot is rejected as too old and a fresh one is requested.
 5. **Snapshot requests** carry the symbol's current epoch.
    - The processor requests a snapshot when the symbol enters Unsynced (§5.7) and whenever it
      discards one.
-   - At most one request per symbol and epoch is outstanding; an epoch reset clears the
-     outstanding mark.
+   - A request is published by storing `(epoch, request number)` into the symbol's request
+     slot (§6.1), where the request number increases with every request. The scheduler always
+     serves the newest value in a slot (§6.3). A request is therefore never lost when it is
+     superseded, discarded as non-current, or issued again within the same epoch.
+   - While a request for the current epoch is outstanding, the processor does not publish
+     another. The mark is cleared when a snapshot record for the symbol is processed, or by an
+     epoch reset.
    - A symbol's last-seen epoch starts as *none*, so its first transition — and its first
      request — happens at its first record. The snapshot is therefore requested only after the
      connection has delivered data, when diffs are already being buffered, as Binance's
@@ -509,7 +523,7 @@ processed normally. On every other cause it runs while the record is processed.
 |---|---|
 | Record with a `conn_epoch` *lower* than the symbol's last-seen epoch | Invariant violation (impossible live: records arrive in order and epochs only grow). Counted as `epoch_regressions`; the record is skipped. In replay it indicates a corrupted input |
 | depth5 or trade payload parse error | Counted; no row; book unchanged |
-| Payload `s` ≠ stream symbol | Parse error (defensive) |
+| Payload `s` (when present; spot depth5 and REST snapshots have none) ≠ stream symbol | Parse error (defensive) |
 | Snapshot too old or not authoritative | Discarded; a new one is requested (§5.4) |
 | REST transport failure, 429 or 418 | Retried by the scheduler (§6.3) |
 | REST 4xx other than 429/418 (for example 400 `-1121 Invalid symbol`) | Fatal configuration error: shutdown with exit code 1. Unknown symbols are normally caught earlier by startup validation (§6.3) |
@@ -518,8 +532,7 @@ processed normally. On every other cause it runs while the record is processed.
 
 Epochs are tracked per symbol, not per shard. A symbol has no market-data records between a
 disconnect and its own first record on the new connection, so resetting at that record discards
-no data. A snapshot received after the reconnect carries the new epoch and triggers the reset
-itself. This makes each symbol's output a function of its own records only (§7). A shard-wide
+no data. This makes each symbol's output a function of its own records only (§7). A shard-wide
 reset, triggered by whichever symbol's record arrives first, would make a symbol's output depend
 on other symbols' timing, which per-symbol files could not reproduce.
 
@@ -555,7 +568,7 @@ coverage exhaustion and depth5 mismatch.
  │ RestScheduler: paced HTTPS snapshots ──────┼─┤ SPSC │  2. write market-data / sidecar row      │
  │ signal_set, --duration, reconnect timers   │ ├─ring─►  3. parse payload once (simdjson)        │
  │                                            │ │      │  4. sync / book / cross-check (§5)       │
- │ 10 ms poll ◄── request queue, fatal flag ──┼─┼──────┤  5. write order-book row (§5.8)          │
+ │ 10 ms poll ◄── request slots, fatal flag ──┼─┼──────┤  5. write order-book row (§5.8)          │
  └────────────────────────────────────────────┘ │      │  periodic: flush (1 s), stats line       │
                                                 │      └──────────────────────────────────────────┘
  replay: CSV reader + sidecar injection ────────┘  (same processor; no io thread, no sockets)
@@ -570,11 +583,13 @@ The threads share exactly three things:
 
 1. The SPSC ring (acquire/release atomics) and its producer-closed flag.
 2. Two channels from the processor back to the io thread, both allocation-free:
-   - a pre-allocated SPSC **request queue** of (symbol index, epoch), with capacity 2 ×
-     symbols. Each symbol has at most one outstanding request per epoch, so it cannot overflow;
+   - one atomic 64-bit **request slot per symbol**, holding `(epoch, request number)`. The
+     processor overwrites it to request a snapshot. A slot holds only the latest request, so
+     it cannot overflow, however many epochs a lagging processor works through between scans;
    - an atomic **fatal flag** carrying the exit code.
 
-   The io thread drains both on a 10 ms steady timer. `asio::post` is not used from the
+   On a 10 ms steady timer the io thread scans the slots and the flag. It hands every slot whose
+   value changed since the last scan to the scheduler. `asio::post` is not used from the
    processor, because each post allocates a handler.
 3. Relaxed atomic metric counters.
 
@@ -655,7 +670,16 @@ budget. Limits verified live on 2026-10-11 via `exchangeInfo` and `X-MBX-USED-WE
 
 - **Pacing:** a token bucket with capacity = budget, refilled at budget / 60 per second. A
   request is dispatched only when the bucket holds its weight and fewer than 4 requests are in
-  flight. Requests are served FIFO; a symbol has at most one queued or in-flight request.
+  flight. Requests are served FIFO.
+- **One slot per symbol, holding the latest wanted request.** The slot holds the newest
+  `(epoch, request number)` seen from the processor.
+  - A newer value replaces a queued request in place, keeping its queue position.
+  - If a request is in flight when a newer value arrives, the newer one is queued as soon as the
+    in-flight request completes. The completed response is still delivered or discarded by the
+    rules below.
+  - A symbol therefore has at most one request in flight and at most one queued. It always ends
+    up with a response for the latest epoch it asked about, unless that epoch is superseded
+    first.
 - **Reconciliation:** every response's `X-MBX-USED-WEIGHT-1M` is read. If the server-reported
   usage leaves less than one request's weight below our budget, dispatch pauses until the start
   of the next minute.
@@ -941,15 +965,16 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 | simdjson parser (capacity 1 MiB, ≈ 5× capacity) | ≈ 5 MiB | Fixed |
 | Decode scratch (20 000 diff levels + 2 000 snapshot levels, 16 B each) | ≈ 344 KiB | Fixed |
 | Sidecar escape scratch | 64 KiB | Fixed |
-| Request queue (2 × symbols entries) | < 8 KiB | Fixed |
+| Request slots (one 8-byte atomic per symbol) | ≤ 2 KiB | Fixed |
+| Minify scratch (one payload, ≤ 1 MiB, §3.3) | 1 MiB | Fixed |
 | Writer buffers (2 × 64 KiB) | 128 KiB | Per symbol |
 | Books: live + refresh shadow, each 2 sides × 5 001 levels × 16 B | ≈ 313 KiB | Per symbol |
 | Recent-diff window (20 000 levels × 16 B + 2 000 headers × 40 B) | ≈ 391 KiB | Per symbol |
 | Pending snapshot (2 × 1 000 levels × 16 B) | ≈ 31 KiB | Per symbol |
 
 - **Per symbol:** ≈ 0.85 MiB.
-- **One symbol:** ≈ 16 + 5 + 0.3 + 0.85 ≈ 22 MiB.
-- **256 symbols:** ≈ 64 + 5 + 0.3 + 216 ≈ 285 MiB.
+- **One symbol:** ≈ 16 + 5 + 1.4 + 0.85 ≈ 23 MiB (fixed scratch: decode, sidecar, minify, slots ≈ 1.4 MiB).
+- **256 symbols:** ≈ 64 + 5 + 1.4 + 216 ≈ 286 MiB.
 
 **Network storage** (io thread). Connections = ⌈symbols ÷ `--symbols-per-connection`⌉.
 
@@ -975,8 +1000,8 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
   (`VmHWM`).
 - **Acceptance:** `VmHWM ≤ budget_mib`. `live_smoke.sh` (M5) and the long runs in M6 fail
   otherwise.
-- **Example budgets:** ≈ 22 + 0.3 + 5.4 + 48 ≈ 76 MiB for one symbol;
-  ≈ 285 + 80 + 260 + 48 ≈ 673 MiB for 256 symbols on 256 connections.
+- **Example budgets:** ≈ 23 + 0.3 + 5.4 + 48 ≈ 77 MiB for one symbol;
+  ≈ 286 + 80 + 260 + 48 ≈ 674 MiB for 256 symbols on 256 connections.
 - The operating system commits pages only when they are touched, so a quiet symbol's resident
   memory stays below its reservation.
 - The `retained_bytes` gauge reports processor and ring storage plus the receive buffers'
@@ -998,7 +1023,8 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
     its own source.
   - The README explains both readings of the command. As written (basic regex, `|` literal) it
     prints nothing. Read as alternation (`-E`), it matches only the `config/secrets.json` line the
-    brief requires in `.gitignore`, plus the README's own policy text.
+    brief requires in `.gitignore`, plus documentation that discusses this check (the README,
+    design.md and requirements.md). It never matches source code or data.
 - **`.env.example`** exists only because the brief asks for one: it contains comments stating
   that no environment variables or credentials are used, and all settings are command-line
   flags.
@@ -1093,8 +1119,8 @@ docs/                      design.md, requirements.md
 
 Keeping Boost out of `blc_core` keeps the book, CSV and replay logic independent of the network
 stack. The processor reaches the network only through the `SnapshotRequester` interface. In
-capture it pushes into the pre-allocated request queue that the io thread drains (§6.1); replay
-passes a no-op implementation. The allocation test (§10) uses the real queue.
+capture it writes the symbol's atomic request slot, which the io thread scans (§6.1); replay
+passes a no-op implementation. The allocation test (§10) uses the real slots.
 
 ## 12. Toolchain, dependencies and CI
 
@@ -1168,9 +1194,11 @@ results derived independently of the code under test.
 | **Exchange simulator** (property test) | A reference "exchange" holds a full-depth book and generates random activity: diffs, depth5, trades, REST snapshots truncated to 1 000 levels, reconnects. The output is fed through the processor. Every emitted row must equal the simulator's true top 5 at that point, and output may be suppressed only when the rules require it. 10⁵+ steps across seeds, both venues |
 | **Scenario fixtures** | Small hand-written market-data + sidecar files with hand-derived expected order-book CSVs: initial sync with overlap, spot/usdm bridge boundaries, gap → resync, two symbols on one shard across a reconnect (each replayed alone), coverage exhaustion, depth5 mismatch → resync, depth5 extending beyond coverage (no false mismatch), oversized diff, sync completed by a later diff, reversed envelope, trade side mapping, and two successive same-day runs with the first run's archived set replayed from its `replaced_<…>/` directory |
 | **Consistency** | Golden-file replay of captured fixtures; live → replay `cmp` on `samples/` |
-| **`capture_loopback` integration** (CI, under ASan+LSan and TSan) | Exercises the real `WsShard`, `RestScheduler` and TLS stack against an in-process server on 127.0.0.1: a Beast TLS WebSocket server plus an HTTPS depth endpoint. A test CA and server certificate are generated in memory at test start (no key material is committed) and injected into the client's `ssl::context`, so peer and hostname verification stay on. Endpoints and CA reach the client through the library-level capture configuration, not the CLI. Covers connect, frames, snapshot sync, 429 cooldown, server-forced reconnect, a loss transition, SIGINT via `raise`, a second SIGINT, and `--duration` expiry. Asserts correct outputs, a clean exit, and no leak or race reports |
+| **`capture_loopback` integration** (CI, under ASan+LSan and TSan) | Exercises the real `WsShard`, `RestScheduler` and TLS stack against an in-process server on 127.0.0.1: a Beast TLS WebSocket server plus HTTPS `depth` and `ticker/price` endpoints (the latter
+answering valid and invalid symbols, so startup validation runs for real). A test CA and server certificate are generated in memory at test start (no key material is committed) and injected into the client's `ssl::context`, so peer and hostname verification stay on. Endpoints and CA reach the client through the library-level capture configuration, not the CLI. Covers connect, frames, snapshot sync, 429 cooldown, server-forced reconnect, a loss transition, SIGINT via `raise`, a second SIGINT, and `--duration` expiry. Asserts correct outputs, a clean exit, and no leak or race reports |
 | `replay` CLI | Replay through the `market_data_*.csv` glob skips order-book files; one failing file does not stop the others; exit codes 0/1/2 |
-| `live_smoke.sh` (local) | 60 s live capture per venue with an ASan build, ended by SIGINT (zero LSan reports); `verify_outputs.sh`; replay → `cmp`; `depth5_mismatch=0`; peak RSS within budget |
+| `live_smoke.sh` (local) | 60 s live capture per venue with an ASan build, ended by SIGINT (zero LSan reports); `verify_outputs.sh`; replay → `cmp`; `depth5_mismatch=0` for each venue on the `resync` policy (a venue on `count-only`, §5.6, only reports its rate); peak RSS within budget |
+| `rest_scheduler` | Token bucket and FIFO order; header reconciliation; global 429/418 cooldown; slot replacement when a newer `(epoch, request number)` arrives while a request is queued, and again while one is in flight (the newer one is served after it completes); non-current responses discarded; other 4xx fatal |
 
 TDD applies: each module's tests are written before its implementation.
 

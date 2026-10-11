@@ -16,10 +16,11 @@ concurrency:
 
 env:
   DEBIAN_FRONTEND: noninteractive
-  # Exactly the prerequisites listed in the README (Ubuntu 22.04). git and ca-certificates are
-  # only needed by the CI container itself (checkout, HTTPS downloads).
-  README_APT_PACKAGES: cmake ninja-build g++-12 libssl-dev libboost-all-dev zlib1g-dev
-  CI_APT_PACKAGES: git ca-certificates
+  # Exactly the prerequisites listed in the README (Ubuntu 22.04): the brief's list plus
+  # ca-certificates, which TLS verification needs and minimal images lack. git is only needed by
+  # the CI container itself (checkout).
+  README_APT_PACKAGES: cmake ninja-build g++-12 libssl-dev libboost-all-dev zlib1g-dev ca-certificates
+  CI_APT_PACKAGES: git
 
 jobs:
   build:
