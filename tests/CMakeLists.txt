@@ -45,11 +45,13 @@ add_executable(unit_tests
     pipeline_consumer_test.cpp
     replay_test.cpp
     scenarios_test.cpp
+    net_endpoints_test.cpp
+    net_attempt_limiter_test.cpp
     support/counting_allocator.cpp
     support/exchange_sim.cpp
     support/loss_scenario.cpp
     support/payload_json.cpp)
-target_link_libraries(unit_tests PRIVATE blc_core GTest::gtest_main)
+target_link_libraries(unit_tests PRIVATE blc_core blc_net GTest::gtest_main)
 set(BLC_TEST_SOURCE_DIR "${PROJECT_SOURCE_DIR}")
 configure_file(support/paths.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/support/paths.hpp" @ONLY)
 target_include_directories(unit_tests PRIVATE

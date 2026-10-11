@@ -36,6 +36,27 @@ target_compile_features(blc_core PUBLIC cxx_std_17)
 target_link_libraries(blc_core PUBLIC simdjson)
 blc_set_warnings(blc_core)
 
+# Networking (Boost.Beast/Asio + OpenSSL); kept out of blc_core so replay and the unit-tested
+# pipeline never depend on it.
+find_package(Threads REQUIRED)
+find_package(Boost 1.74 REQUIRED)
+if(MINGW)
+    set(OPENSSL_USE_STATIC_LIBS ON)
+endif()
+find_package(OpenSSL REQUIRED)
+
+add_library(blc_net STATIC
+    blc/net/attempt_limiter.cpp
+    blc/net/endpoints.cpp)
+target_link_libraries(blc_net PUBLIC blc_core Boost::headers OpenSSL::SSL OpenSSL::Crypto
+    Threads::Threads)
+target_compile_definitions(blc_net PUBLIC BOOST_ASIO_NO_DEPRECATED)
+if(WIN32)
+    target_link_libraries(blc_net PUBLIC ws2_32 mswsock crypt32)
+    target_compile_definitions(blc_net PUBLIC _WIN32_WINNT=0x0A00)
+endif()
+blc_set_warnings(blc_net)
+
 add_executable(binance_capture main.cpp)
 target_link_libraries(binance_capture PRIVATE blc_core)
 blc_set_warnings(binance_capture)
