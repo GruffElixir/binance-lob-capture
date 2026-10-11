@@ -42,6 +42,7 @@ add_executable(unit_tests
     pipeline_processor_test.cpp
     pipeline_loss_integration_test.cpp
     pipeline_allocation_test.cpp
+    pipeline_consumer_test.cpp
     support/counting_allocator.cpp
     support/exchange_sim.cpp
     support/loss_scenario.cpp
