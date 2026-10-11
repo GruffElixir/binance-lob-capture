@@ -1,8 +1,8 @@
 #include <cstdint>
+#include <simdjson.h>
 #include <string_view>
 
 #include <gtest/gtest.h>
-#include <simdjson.h>
 
 namespace {
 
