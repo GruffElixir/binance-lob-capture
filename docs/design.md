@@ -847,7 +847,8 @@ Steps:
    the fatal flag set) runs `begin_shutdown()` on the io thread:
    - set `stopping`;
    - cancel timers;
-   - the scheduler stops dispatching and cancels in-flight requests;
+   - the scheduler stops dispatching and cancels in-flight requests. A completed body still
+     waiting for ring space is discarded and its dispatch slot released;
    - every shard shuts down according to its connection state (`Waiting` for backoff or a
      limiter token, `Resolving`, `Connecting`, `TlsHandshake`, `WsHandshake`, `Open`,
      `Closing`, `Closed`):
@@ -991,7 +992,7 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 | Decoded REST snapshot | 1 000 levels per side | Rejected, re-requested (§6.5) |
 | Recent-diff window | 20 000 levels / 2 000 diffs per symbol | Oldest dropped, counted |
 | Book side | 5 000 levels | Trimmed to 4 000, coverage adjusted |
-| Concurrent REST requests | 4, plus weight pacing (§6.3) | Queued |
+| REST dispatch slots | 4, plus weight pacing (§6.3) | Queued |
 
 **Processor and ring storage.** Every container below is reserved at startup and never grows
 (§10), so these figures are both the steady state and the maximum.
