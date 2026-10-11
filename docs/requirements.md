@@ -39,7 +39,7 @@ Subscriptions per symbol (lowercase in the URL): `<symbol>@depth@100ms`, `<symbo
 |---|---|---|---|
 | F1 | Live capture from Binance combined streams: `depth@100ms`, `depth5@100ms`, `trade` per configured symbol | URL-builder unit test; live sample run | Planned |
 | F2 | Venues `spot` and `usdm` with the base URLs above | URL-builder unit test; live run per venue | Planned |
-| F3 | Market-data CSV: one row per message applied from the socket, storing the inner `data` payload (envelope removed) | Envelope unit tests; row count == frames received (metrics) | Planned |
+| F3 | Market-data CSV: one row per message applied from the socket, storing the inner `data` payload (envelope removed) | Envelope unit tests; frame-accounting invariant per (shard, epoch): `frames_received = md_rows + malformed_frames + ring_drops`, with every `conn_seq` either in the CSV or counted as a loss (design §8) | Planned |
 | F4 | File naming `market_data_<venue>_<SYMBOL>_<UTC-date>.csv`; choice documented | Writer unit test; README | Planned |
 | F5 | CSV: UTF-8, RFC 4180 quoting (comma/quote/newline → quoted, `"` → `""`), exact header first | CSV writer + reader round-trip tests | Planned |
 | F6 | Column types/ranges: `recv_tnsec` in [0, 999 999 999]; `venue` ∈ {spot, usdm}; `stream_kind` ∈ {depth_diff, depth5, trade}; `shard_id` ≥ 0; `conn_epoch` +1 per reconnect; `conn_seq` monotonic within (shard_id, conn_epoch); `symbol` uppercase; `payload_json` minified one line | Unit tests per column; CSV validator script on sample | Planned |
@@ -81,8 +81,8 @@ Subscriptions per symbol (lowercase in the URL): `<symbol>@depth@100ms`, `<symbo
 | Q7 | Modern C++: `constexpr`, `enum class`, scoped types, no unnecessary macros, const-correct hot structures | clang-tidy CI job | Planned |
 | Q8 | `-Wall -Wextra` (stricter used), Release documented, zero warnings | CI builds with `-Werror` on GCC 12 and Clang 15 | Done (scaffold) |
 | Q9 | Efficient JSON parsing (simdjson On-Demand), parse each payload once, reuse buffers | Code; benchmark | Planned |
-| Q10 | Minimal per-message heap allocation (`reserve`, ring buffers, reuse) | Allocation-counting test: 0 allocations/message in steady state | Planned |
-| Q11 | Top-5 maintenance O(updates) per message; trade-offs vs full-map book explained | Book benchmark (flat vector vs `std::map`); README | Planned |
+| Q10 | Minimal per-message heap allocation (`reserve`, ring buffers, reuse) | Allocation-counting test with no warm-up: zero allocations in the processor for every record kind and state, as scoped in design §10 (network path, logging, startup/shutdown and the replay reader excluded) | Planned |
+| Q11 | Efficient top-5 maintenance per message (the brief asks for O(updates)); trade-offs vs a full-map book explained | Design §5.1 states the actual cost: O(log k) search + O(k) moves per level, k = levels better than the price, worst case O(n) for deep levels. Benchmark of flat vector vs `std::map` covering near-touch and deep updates and deletions; README states the result and trade-off | Planned |
 | Q12 | File/socket back-pressure; buffered writes vs dedicated writer thread decision documented | README design note; ring-buffer high-water metric | Planned |
 | Q13 | Clear thread boundaries, no data races, no contended locks per tick | SPSC ring tests under TSan; README | Planned |
 | Q14 | Metrics: messages processed, parse errors, reconnects, rows written | Periodic stats line + final summary | Planned |

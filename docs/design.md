@@ -78,13 +78,19 @@ Capture writes three files per symbol:
   file starts with an `R` row.
 - All files for all configured symbols are created at startup, with their header rows.
 - The sidecar deliberately does not match the `market_data_*.csv` or `*_orderbook.csv` globs.
-- **Existing files are never overwritten and never cause an error.** A file that already exists
-  is first renamed to `<name>.replaced-<run start, YYYYMMDDTHHMMSSZ>` (adding `-1`, `-2`, … if
-  that name is taken), and a warning names both files. The brief's own README sequence writes
-  several runs into `./output` on the same day, so refusing would break it, and truncating would
-  silently destroy an earlier capture. Renamed files match none of the output globs.
-- **Replay** writes `<output-dir>/<input file stem>_orderbook.csv` for each input file, with the
-  same rename rule.
+- **Existing files are never overwritten and never cause an error.** If any of a symbol's three
+  files already exists, every existing file of that symbol is moved, keeping its name, into one
+  archive directory for the run: `<output-dir>/replaced_<run start, YYYYMMDDTHHMMSSZ>/` (with
+  `-1`, `-2`, … appended if that directory exists). A warning names the directory.
+  - A symbol's three files are always created together by one run, so an archived set keeps
+    its pairing: the archived market-data file finds its sidecar under the original name and
+    replays exactly like the original (§7).
+  - The brief's own README sequence writes several runs into `./output` on the same day, so
+    refusing would break it, and truncating would silently destroy an earlier capture.
+  - Archive directories are not matched by the output globs, which do not descend into
+    directories.
+- **Replay** writes `<output-dir>/<input file stem>_orderbook.csv` for each input file. An
+  existing file of that name is moved into a `replaced_<…>/` directory in the same way.
 
 ### 3.2 CSV encoding (all files)
 
@@ -255,17 +261,19 @@ is at the back**: bids ascending, asks descending.
   (n ≤ 5 000 levels of 16 bytes). This is not O(1) per update in the worst case, and the
   benchmark (§10) measures deep updates and deletions as well as near-touch traffic.
 - **Top-5 read:** O(1) per level, from the back.
-- **Cap:** 5 000 levels per side. When exceeded, the worst levels are trimmed in one batch down
-  to 4 000 and the coverage boundary is adjusted (§5.3).
-- Storage is reserved to the snapshot size when a snapshot is loaded; afterwards it grows only if
-  diffs add levels, so the steady state does not allocate.
+- **Cap:** 5 000 levels per side. The cap is checked after every insertion; an insertion that
+  takes a side to 5 001 levels trims the worst levels in one batch down to 4 000 and adjusts
+  coverage (§5.3).
+- **Storage:** each side reserves 5 001 levels (the cap plus one insertion) once, when the symbol
+  is set up at startup. Because the trim check runs after every insertion, a side never needs
+  more, so loading snapshots and applying diffs never reallocate.
 
 | | Flat vector, best at back (chosen) | `std::map<int64,int64>` |
 |---|---|---|
 | Update near touch | O(log k) search + k contiguous moves; no allocation | O(log n) pointer chasing + node allocation on insert |
 | Deep update or delete | Up to O(n) contiguous moves (16-byte elements) | O(log n) |
 | Top-5 read | 5 contiguous loads | 5 node hops |
-| Allocation per message | None after warm-up | One per inserted level |
+| Allocation per message | None (storage reserved at startup) | One per inserted level |
 
 ### 5.2 Event semantics
 
@@ -300,8 +308,11 @@ stay unknown until they change. The book therefore tracks how far it is known to
   prices that later diffs touched are known; untouched resting levels may exist there.
 - Diffs never move the boundary: a diff beyond it reveals only the prices it names, not the
   levels in between.
-- Trimming (§5.1) that removes a level at or better than the boundary moves the boundary to the
-  worst remaining level, and the side becomes incomplete.
+- **Trimming** (§5.1) has two cases:
+  - **Complete side:** any trim revokes completeness. The side becomes bounded, with its boundary
+    at the worst retained price, because evicted levels still exist on the exchange.
+  - **Bounded side:** if the trim removed any level at or better than the boundary, the boundary
+    moves to the worst retained price; otherwise it is unchanged.
 - A side's **coverage margin** is the number of levels at or better than its boundary (unbounded
   for a complete side).
 - A side is **authoritative** if it is complete or its margin is at least 5. Only then can its
@@ -332,8 +343,10 @@ and replaying the window — so the rules cannot drift apart:
 | usdm | `u ≤ r` | `pu ≠ r` | otherwise |
 
 **Recent-diff window.** Each symbol keeps the most recent contiguous diffs, decoded into owned
-integers, in a circular arena bounded at 20 000 levels and 2 000 diffs. When full, the oldest
-diffs are dropped (counted as `window_trimmed`). A diff is classified against the window's last
+integers, in a circular arena of 20 000 levels and 2 000 diffs, reserved at startup. A diff
+that does not fit is admitted by dropping the oldest diffs (counted as `window_trimmed`).
+Every accepted diff fits: a diff with more than 20 000 levels is rejected while parsing
+(§6.5) and handled as a gap, never truncated. A diff is classified against the window's last
 `u`: stale → not appended (counted as `stale_diffs`); gap → the window is cleared and restarts
 with this diff (counted as `window_resets`); continues → appended. While Unsynced the window is
 the sync buffer. While Synced it holds the applied diffs that a background refresh needs (§5.5).
@@ -418,11 +431,20 @@ A pending check is resolved when the next diff *d* = (`U`, `u`) is applied:
 | `p > u` | Keep pending |
 
 - **Full check:** on each side the book's best levels equal the depth5 levels (same count,
-  prices and quantities).
-- **Partial check:** within depth5's price range on each side, every price not present in *d*
-  has the same presence and quantity in the book and in depth5. Prices not touched by *d* did not
-  change between *id* and *u*, so their state at *p* is known exactly.
-- Both checks are exact because the book is authoritative whenever it is Synced (§5.3).
+  prices and quantities). A full check always runs on a book state that has passed the
+  coverage rule, so the book's top 5 is authoritative and every level compared lies within
+  coverage. After *d* is applied, coverage is evaluated first; if the book became Unsynced, the
+  pending check is discarded.
+- **Partial check:** compares only the prices that lie inside both depth5's price range and the
+  book's trusted coverage on that side (at or better than the boundary; the whole range on a
+  complete side), and that *d* does not touch. Each such price must have the same presence and
+  quantity in the book and in depth5. Prices not touched by *d* did not change between *id* and
+  *u*, so their state at *p* is known exactly.
+  - depth5 describes an intermediate state at *p*, so its 5th level can lie beyond coverage
+    even when the book's own top 5 do not. For example: trusted bids 10–6 with boundary 6, and
+    *d* deletes 10 and adds 11. depth5 then shows 9–5, and 5 was never known.
+  - Prices outside coverage are therefore never compared; they are counted as
+    `depth5_levels_unchecked`. Top-5 authority does not extend to a wider range.
 - **Match:** counted as `depth5_verified` or `depth5_partially_verified`.
 - **Mismatch:** counted as `depth5_mismatch`; the first 10 are logged with both level sets. The
   book has been shown wrong somewhere, possibly below the depth5 range, so it becomes Unsynced and
@@ -577,8 +599,9 @@ budget. Limits verified live on 2026-10-11 via `exchangeInfo` and `X-MBX-USED-WE
 
 ### 6.4 Record queue (SPSC ring)
 
-- One pre-allocated byte ring of 16 MiB + 256 KiB per symbol (80 MiB at 256 symbols) between the
-  io thread and the processor.
+- One pre-allocated byte ring between the io thread and the processor. Its capacity is a power
+  of two, as the position arithmetic requires: 16 MiB for 1–64 symbols, 32 MiB for 65–128, and
+  64 MiB for 129–256 (256 KiB per symbol at the top of each band).
 - Each record is contiguous and 64-byte aligned: a fixed header, the payload, then
   `SIMDJSON_PADDING` bytes so simdjson parses the payload in place. A record that does not fit
   before the end of the buffer is preceded by a wrap marker.
@@ -595,10 +618,13 @@ budget. Limits verified live on 2026-10-11 via `exchangeInfo` and `X-MBX-USED-WE
   produces a sequence gap, which the book handles by resyncing (§5.7). At the measured BTCUSDT
   rate (spot ≈ 7 KiB/s, usdm ≈ 15 KiB/s) a single-symbol ring covers about 18 minutes of
   processor stall.
-- **Why a custom ring:** it gives a hard byte bound and contiguous, padded payloads for in-place
-  parsing. A proven fixed-slot queue (`boost::lockfree::spsc_queue` of slot indices plus a buffer
-  pool) needs per-slot buffers sized for the largest message, or growth that breaks the byte
-  bound.
+- **Why a custom ring:** variable-length records are packed back to back, so memory is used in
+  proportion to actual payload sizes. Each payload is contiguous and padded, so it can be parsed
+  in place. A proven alternative — `boost::lockfree::spsc_queue` of slot indices plus a
+  fixed-total-size buffer pool — would also enforce a hard memory cap. But each slot must either
+  be sized for the largest message (wasting most of the pool on ~1–6 KB frames) or chain
+  fixed-size chunks (making payloads non-contiguous, so they need copying before simdjson can
+  parse them).
 - **Risk control:** the ring is the riskiest component. It is the first task of M4, built and
   tested on its own before anything is wired to it. Its unit tests
   cover every wrap case, plus a randomised length fuzz and a two-thread stress test run under
@@ -628,6 +654,18 @@ For each record, in ring order:
   fields must appear exactly once with the expected types, levels must be arrays of exactly two
   strings, and the document must be fully consumed (`at_end()`). Any simdjson error is a parse
   error.
+- **Decoded-size limits.** JSON size does not bound decoded size: `["1","1"]` is about 10
+  bytes of JSON but a 16-byte level. The parser therefore counts levels as it decodes them and
+  stops at the limit, so the decode scratch (reserved at startup) never grows:
+
+  | Event | Limit | Over the limit |
+  |---|---|---|
+  | Diff | 20 000 levels, bids + asks (the window's capacity) | Counted as `oversized_events`; handled as a diff parse error, i.e. a gap → resync (§5.7). Never truncated |
+  | depth5 | 5 levels per side | Parse error |
+  | REST snapshot | 1 000 levels per side (the requested `limit`) | Counted as `oversized_events`; snapshot discarded and re-requested |
+  | Trade | — | — |
+
+  Live traffic is far below these limits (largest diff in the probe: 154 levels).
 - **Ownership:** decoded values are copied into owned integers (events, window, pending
   snapshot, pending depth5 check) before the record is released. No `string_view`,
   `ondemand::value` or document outlives the record it came from; the parser is reused for the
@@ -736,16 +774,17 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 ## 8. Observability
 
 - **io-thread counters** (relaxed atomics):
-  - frames and bytes received per stream kind, `malformed_frames`, `ring_drops`;
+  - `frames_received` and bytes per stream kind, `malformed_frames` (invalid envelope or
+    unsubscribed stream), `ring_drops`;
   - `connects`, `reconnects`, `connect_failures`;
   - `rest_requests`, `rest_failures`, `rest_cooldowns`, `rest_weight_used`.
 - **Processor counters:**
   - rows: `md_rows`, `ob_rows`, `snapshot_rows`;
-  - sequencing: `parse_errors`, `stale_diffs`, `gaps`, `window_resets`, `window_trimmed`,
-    `syncs`, `resyncs`, `snapshot_too_old`, `coverage_exhausted`;
+  - sequencing: `parse_errors`, `oversized_events`, `stale_diffs`, `gaps`, `window_resets`,
+    `window_trimmed`, `syncs`, `resyncs`, `snapshot_too_old`, `coverage_exhausted`;
   - refresh: `refresh_ok`, `refresh_mismatch`;
   - depth5: `depth5_verified`, `depth5_partially_verified`, `depth5_mismatch`, `depth5_stale`,
-    `depth5_unchecked`;
+    `depth5_unchecked`, `depth5_levels_unchecked`;
   - other: `payloads_minified`, `ring_high_water`, `retained_bytes` (capacity of all
     per-symbol containers plus fixed buffers);
   - a fixed-bucket log2 histogram of receive → row-written latency (steady clock).
@@ -755,6 +794,13 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
   ring_hw_kib=12 retained_kib=1830 lat_p50_us=4 lat_p99_us=21`
 - **Final summary** at exit: the same counters, totals and per symbol, plus peak RSS (`VmHWM`
   from `/proc/self/status`).
+- **Frame accounting invariant:** for every (shard, epoch),
+  `frames_received = md_rows + malformed_frames + ring_drops`. Every `conn_seq` number from 0
+  to `frames_received − 1` therefore appears exactly once in the market-data CSVs or is
+  accounted for by one of the two loss counters. It is checked in two places:
+  - the final summary checks the totals;
+  - `verify_outputs.sh` checks each (shard, epoch) against the `epoch_closed shard=… epoch=…
+    frames=… malformed=… drops=…` line the io thread logs when a connection ends or at shutdown.
 - **Logging:** stderr, levels `info`/`warn`/`error`, ISO-8601 UTC timestamps. Repeated errors
   are rate-limited (first 10, then every 1000th). Nothing is logged per message on the normal
   path.
@@ -764,30 +810,36 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 | Limit | Value | On violation |
 |---|---|---|
 | Symbols per process | 256 | Usage error |
-| Streams per connection | spot 1 024 (341 symbols); usdm 200 (66 symbols) — §15 | Usage error |
+| Streams per connection | 1 024 on both venues (341 symbols) — §15 | Usage error |
 | Stream URL length | 8 192 bytes (often the binding limit: ≈ 94 bytes per 20-character symbol) | Usage error |
 | WebSocket message | 4 MiB | Frame rejected (Beast error) → reconnect, counted |
 | REST body | 2 MiB (a `limit=1000` snapshot is ≈ 64 KB spot, ≈ 42 KB usdm) | Request failed → retry, counted |
+| Decoded diff | 20 000 levels | Rejected, handled as a gap (§6.5) |
+| Decoded REST snapshot | 1 000 levels per side | Rejected, re-requested (§6.5) |
 | Recent-diff window | 20 000 levels / 2 000 diffs per symbol | Oldest dropped, counted |
 | Book side | 5 000 levels | Trimmed to 4 000, coverage adjusted |
 | Concurrent REST requests | 4, plus weight pacing (§6.3) | Queued |
 
-**Memory budget** (retained capacity; reused containers keep their capacity, so these are the
-steady-state maxima):
+**Memory budget.** Every container below is reserved at startup and never grows (§10), so these
+figures are both the steady state and the maximum.
 
-| Item | Per symbol | Fixed |
+| Item | Size | Scope |
 |---|---|---|
-| Ring | 256 KiB | 16 MiB |
-| simdjson parser (capacity 4 MiB, ≈ 5× capacity) | — | ≈ 20 MiB |
-| Event scratch (diff levels; grows only to the largest message seen) | — | ≤ 4 MiB |
-| Writer buffers (2 × 64 KiB) | 128 KiB | — |
-| Book, 2 sides × 5 000 levels × 16 B (twice during a refresh) | ≤ 320 KiB | — |
-| Recent-diff window (20 000 levels × 16 B + headers) | ≤ 360 KiB | — |
-| **Total** | **≤ ~1.1 MiB** | **≈ 40 MiB** |
+| Ring (§6.4) | 16 / 32 / 64 MiB by symbol count | Fixed |
+| simdjson parser (capacity 4 MiB, ≈ 5× capacity) | ≈ 20 MiB | Fixed |
+| Decode scratch (20 000 diff levels + 2 000 snapshot levels, 16 B each) | ≈ 344 KiB | Fixed |
+| Writer buffers (2 × 64 KiB) | 128 KiB | Per symbol |
+| Books: live + refresh shadow, each 2 sides × 5 001 levels × 16 B | ≈ 313 KiB | Per symbol |
+| Recent-diff window (20 000 levels × 16 B + 2 000 headers × 40 B) | ≈ 391 KiB | Per symbol |
+| Pending snapshot (2 × 1 000 levels × 16 B) | ≈ 31 KiB | Per symbol |
 
-That is about 41 MiB for one symbol and about 320 MiB at the 256-symbol limit. The
-`retained_bytes` gauge and the peak-RSS figure in the final summary check these numbers in the
-live smoke test.
+- **Per symbol:** ≈ 0.85 MiB.
+- **One symbol:** ≈ 16 + 20 + 0.3 + 0.85 ≈ 37 MiB.
+- **256 symbols:** ≈ 64 + 20 + 0.3 + 216 ≈ 300 MiB.
+
+The operating system commits pages only when they are touched, so a quiet symbol's resident
+memory stays below its reservation. The `retained_bytes` gauge and the peak-RSS figure in the
+final summary check these numbers in the live smoke test.
 
 **Security:**
 
@@ -803,18 +855,29 @@ live smoke test.
   splitting is a bounded byte scan (§6.2). Levels are read with `get_raw_json_string()` (prices
   contain no escapes) straight into the decimal parser.
 - **Zero heap allocations per record — scope of the claim:**
-  - **Covered:** the processor's per-record path for a Synced symbol after warm-up — payload
-    parse, sequence classification, window append, book update, depth5 check, row formatting and
-    the buffered write.
+  - **Covered:** everything the processor does for a record, for every record kind and in every
+    state, starting with the first record after startup:
+    - payload parse;
+    - sequence classification and window append;
+    - synchronisation, resync and refresh (snapshot load, shadow build, swap);
+    - book updates and trims;
+    - depth5 checks;
+    - row formatting and writes.
+
+    This holds because every processor and per-symbol container is reserved to its cap at
+    startup (§9), and the decode limits (§6.5) keep every event within those caps.
   - **Not covered:**
     - the network path: our buffers there (Beast `flat_buffer`, ring) are reused, but Asio,
       Beast and OpenSSL may allocate internally;
-    - synchronisation, resync and refresh transitions, where loading a snapshot may grow book
-      storage up to the snapshot size;
-    - startup, file creation and shutdown.
-  - **Proof:** a unit test replaces global `operator new`/`delete` with counting versions, replays
-    recorded traffic through the processor after a warm-up, and asserts the count stays 0 for the
-    covered path.
+    - log lines: these are only formatted on the rate-limited warning/error path;
+    - startup, archive moves, file creation and shutdown;
+    - replay's CSV reader, whose row buffer grows to the longest row read.
+  - **Proof:** a unit test replaces global `operator new`/`delete` with counting versions and
+    arms the counter right after the processor is constructed. There is no warm-up: a warm-up
+    would hide growth beyond what the warm-up traffic happened to reach. The logger suspends the
+    counter while it formats. Records from the scenario fixtures and the exchange simulator
+    (§13) exercise sync, gap, resync, coverage exhaustion, refresh and trimming, and the test
+    asserts the count stays 0.
 - **Benchmarks** (`bench/`, off by default, plain `std::chrono` harness with repetitions and
   percentiles):
   - decimal parsing;
@@ -927,15 +990,17 @@ results derived independently of the code under test.
 | `sequence` | Stale / gap / continues for both venues at every boundary, including spot overlap (`[100,105]` then `[103,108]`) |
 | `diff_window` | Append, stale skip, reset on gap, oldest-first trimming by levels and by count, wrap-around |
 | `sync` | Both venues: snapshot older/newer than the window, bridge conditions at exact boundaries, sync completed by a later diff (timestamp of that diff), too-old refetch, epoch reset, parse error as gap |
-| `coverage` | Complete vs bounded sides, margin, exhaustion → Unsynced, trimming moves the boundary |
-| `depth5_check` | All four resolution cases; full and partial match; mismatch → Unsynced; stale and unchecked counting |
+| `coverage` | Complete vs bounded sides, margin, exhaustion → Unsynced; trimming a bounded side inside and outside coverage; trimming a complete side revokes completeness (no zero padding afterwards) |
+| `payload_limits` | Oversized diff (20 001 levels) → rejected as a gap, never truncated; oversized snapshot → re-requested; decode scratch never grows |
+| `depth5_check` | All four resolution cases; full and partial match; mismatch → Unsynced; stale and unchecked counting; partial check excludes prices beyond coverage (the 10–6 / 9–5 example in §5.6 must not mismatch); pending check discarded when coverage is exhausted |
 | `refresh` | Shadow sync from the window, snapshot newer than the book, too-old refetch, swap with equal and different top 5, exhaustion during refresh |
 | `processor` | Row emission rules (§5.8), `type`/`side` mapping, `--no-trade-rows`, sidecar `apply_before_row`, per-symbol epoch isolation |
+| `output_files` | Naming; archiving a symbol's existing files as one set into `replaced_<…>/`, including when only some exist; directory-name collisions; replay-output archiving |
 | `spsc_ring` | Every wrap case, padding, full-ring drop, close protocol, randomised length fuzz, two-thread stress (run under TSan) |
 | `shutdown` | Close with an empty ring, a full ring, a second signal, and a writer failure: the consumer always terminates and drains |
 | `allocations` | Zero heap allocations on the covered path (§10) |
 | **Exchange simulator** (property test) | A reference "exchange" holds a full-depth book and generates random activity: diffs, depth5, trades, REST snapshots truncated to 1 000 levels, reconnects. The output is fed through the processor. Every emitted row must equal the simulator's true top 5 at that point, and output may be suppressed only when the rules require it. 10⁵+ steps across seeds, both venues |
-| **Scenario fixtures** | Small hand-written market-data + sidecar files with hand-derived expected order-book CSVs: initial sync with overlap, spot/usdm bridge boundaries, gap → resync, two symbols on one shard across a reconnect (each replayed alone), coverage exhaustion, depth5 mismatch → resync, sync completed by a later diff, reversed envelope, trade side mapping |
+| **Scenario fixtures** | Small hand-written market-data + sidecar files with hand-derived expected order-book CSVs: initial sync with overlap, spot/usdm bridge boundaries, gap → resync, two symbols on one shard across a reconnect (each replayed alone), coverage exhaustion, depth5 mismatch → resync, depth5 extending beyond coverage (no false mismatch), oversized diff, sync completed by a later diff, reversed envelope, trade side mapping, and two successive same-day runs with the first run's archived set replayed from its `replaced_<…>/` directory |
 | **Consistency** | Golden-file replay of captured fixtures; live → replay `cmp` on `samples/` |
 | `live_smoke.sh` (local) | 60 s live capture per venue; `verify_outputs.sh`; replay → `cmp`; `depth5_mismatch=0`; peak RSS within budget |
 
@@ -951,10 +1016,10 @@ TDD applies: each module's tests are written before its implementation.
 | Trades | Annotation rows, book unchanged | Applying fills would double-count the diff stream |
 | Epoch reset | Per symbol, at its first record with a newer epoch | A shard-wide reset makes a symbol's output depend on other symbols' timing and breaks per-file replay |
 | Files | Per symbol, one set per run, named by the run's UTC start date | Daily rotation makes later files depend on earlier ones (no starting snapshot) and complicates replay |
-| Existing output files | Renamed aside (`.replaced-<timestamp>`) | Truncating destroys earlier captures; refusing breaks the brief's README sequence, which reuses `./output` |
+| Existing output files | A symbol's whole file set is moved into `replaced_<timestamp>/`, keeping names, so it stays replayable | Truncating destroys earlier captures; refusing breaks the brief's README sequence, which reuses `./output`; renaming files one by one breaks the market-data ↔ sidecar pairing |
 | REST usage | Weighted token bucket at 50 % of the IP budget, header reconciliation, global cooldown | Concurrency limits alone exceed the budget at scale; per-request `Retry-After` lets other requests continue during a cooldown |
 | Threading | io thread + processor over an SPSC ring | One thread lets disk stalls block the socket; a writer thread adds a hop with no measured benefit |
-| Queue | Custom byte ring, built first under heavy tests | `spsc_queue` + pool lacks a hard byte bound (kept as fallback) |
+| Queue | Custom byte ring, built first under heavy tests | `spsc_queue` + fixed-size pool also caps memory, but either wastes most of each slot or splits payloads, which then need copying before parsing (kept as fallback) |
 | Ring full | Drop newest, counted, visible as `conn_seq` gap | Blocking stalls every connection and their pings, and loses more data through disconnects |
 | Book structure | Sorted flat vector, best at back, galloping search | `std::map` allocates per insert and chases pointers; a price-indexed ladder needs tick sizes and wide ranges |
 | JSON | simdjson On-Demand (vendored) | Boost.JSON requires Boost 1.75 (jammy has 1.74); RapidJSON/nlohmann are slower or allocate per value |
@@ -968,18 +1033,39 @@ TDD applies: each module's tests are written before its implementation.
 
 **Resolved:**
 
-1. **Streams per connection.** Binance's documentation conflicts: the USD-M market-streams page
-   states 1 024 streams per connection, while the USD-M "Connect" page states 200 (as do the
-   COIN-M and options docs). usdm is capped at the stricter 200, spot at 1 024. In practice the
-   8 192-byte URL limit binds first at around 87 symbols.
+1. **Streams per connection.** 1 024 on both venues, checked on 2026-10-11 against the
+   [spot WebSocket streams page](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams),
+   the [USD-M market streams page](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams)
+   and the [USD-M Connect page](https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Connect).
+   (An earlier revision claimed a conflicting figure of 200; that came from a search summary and
+   is not on these pages.) In practice the 8 192-byte URL limit binds first, at around 87
+   symbols of 20 characters.
 2. **REST weights and limits.** Measured on 2026-10-11 (§6.3).
 3. **Snapshot coverage.** Measured on 2026-10-11 (§5.3).
 
-**Checked during live testing (M5 / M8):**
+**Checked during live testing:**
 
-1. **depth5 consistency:** `depth5_mismatch` must be 0 over a 10-minute capture per venue (spot
-   full checks, usdm partial checks). Any mismatch is investigated before submission.
-2. **Coverage:** count `coverage_exhausted` and `refresh_ok` over a 30-minute capture, and
-   record the result in the README.
-3. **US IP block:** confirm GitHub-hosted runners receive HTTP 451 from Binance; if they do not,
-   a live smoke job is added to CI.
+1. **depth5 consistency (M6):** `depth5_mismatch` must be 0 over a 10-minute capture per venue
+   (spot full checks, usdm partial checks). Any mismatch is investigated before submission.
+2. **Coverage (M6, then M7):** count `coverage_exhausted` over a 30-minute capture before the
+   refresh enhancement exists, then `coverage_exhausted` and `refresh_ok` after it; record both
+   in the README.
+3. **US IP block (M5):** confirm GitHub-hosted runners receive HTTP 451 from Binance; if they do
+   not, a live smoke job is added to CI.
+
+## 16. Milestones
+
+Milestone IDs used throughout this document. Each milestone ends with CI green and every
+requirement row it delivers moved to **Done** in [requirements.md](requirements.md).
+
+| ID | Scope | Depends on | Exit criteria |
+|---|---|---|---|
+| M0 | Scaffold, CI, requirements matrix, design | — | Done |
+| M1 | Core primitives: `types`, `decimal`, `time`, `instrument_id`, `symbols`, CSV schema/writer/reader, CLI options, logging. CI: clang-format, ASan + UBSan | M0 | Unit tests green under ASan + UBSan |
+| M2 | Parsing: vendored simdjson, envelope split (fast path + order-independent fallback), payload parsers with decoded-size limits, real-payload fixtures | M1 | Parser and limit tests green |
+| M3 | Order book: `book_side`, coverage, sequence classifier, recent-diff window, sync state machine, depth5 check, exchange simulator | M2 | Simulator property test and sync, coverage and depth5 suites green |
+| M4 | Pipeline + replay: SPSC ring first, alone (TSan job); then processor, output files with archive rule, sidecar, replay mode, scenario fixtures, allocation test. CI: output contract (scenario part), Valgrind | M3 | Every scenario fixture replays to its hand-derived expected output; zero allocations |
+| M5 | Networking (needs WSL): endpoints, TLS, `WsShard`, REST scheduler, capture app, signals and `--duration`, shutdown protocol, metrics and stats | M4 | `live_smoke.sh` passes for both venues (60 s), frame-accounting invariant holds |
+| M6 | Hardening: clang-tidy job, `--fault-reconnect-every`, shutdown tests, limit validation, 10-minute depth5 and 30-minute coverage runs | M5 | All CI jobs green; `depth5_mismatch=0` live |
+| M7 | Enhancement and performance: background coverage refresh (§5.5), benchmarks, README performance numbers | M6 | Refresh suite green; live 30-minute run recorded; benchmark numbers in README |
+| M8 | Submission: 1–2 minute sample captures, live = replay `cmp`, full README (including the brief's submission section), `reviewer_checklist.sh`, tag `v1.0.0`, repository made public with the user's confirmation | M7 | Every mandatory row in requirements.md is Done |

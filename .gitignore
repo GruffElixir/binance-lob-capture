@@ -7,8 +7,11 @@ build/
 .env
 config/secrets.json
 
-# The curated 1-2 minute sample run is part of the submission and must stay tracked.
+# CSVs that are part of the repository: the curated sample run (submission deliverable),
+# captured payload fixtures, and hand-built scenarios with their expected outputs.
 !samples/**/*.csv
+!tests/fixtures/**/*.csv
+!tests/scenarios/**/*.csv
 
 # --- Build trees and tooling ------------------------------------------------
 build-*/
@@ -22,8 +25,8 @@ Testing/
 # --- Run outputs ------------------------------------------------------------
 output/
 replay_output/
-# Earlier outputs moved aside when a run reuses a file name (see docs/design.md §3.1)
-*.replaced-*
+# Earlier capture sets archived when a run reuses file names (see docs/design.md §3.1)
+replaced_*/
 *.log
 perf.data*
 callgrind.out.*
