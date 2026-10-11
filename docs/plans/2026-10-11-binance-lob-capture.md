@@ -26,6 +26,8 @@
 - **Local runs before WSL exists:** M1–M4 build and test on MSYS2 (GCC 16) plus CI. Sanitizer and Linux-only checks (TSan, Valgrind, strace, `/dev/full`, POSIX permissions) are gated by CI until WSL2 Ubuntu 22.04 exists; from M5 on everything also runs in WSL.
 - **Level ranges** are passed as `LevelSpan` (pointer + count), never as freshly built vectors, so the processor path never allocates.
 - **Test command used throughout:** `cmake --build build/debug --target unit_tests && ./build/debug/tests/unit_tests --gtest_filter=<Filter>`, where `build/debug` comes from `cmake --preset debug`.
+- **Build wiring:** each task adds production `.cpp` files to `blc_core` or `blc_net` and test/support `.cpp` files to `unit_tests`. Task 9 configures `tests/support/paths.hpp.in` into the build tree with an absolute, forward-slash source-directory constant. Fixture paths use that constant, never the working directory. Temp outputs are unique to each test. Task 31 configures a separate benchmark fixture-directory constant.
+- **Review evidence:** shell checks follow the [Bash errexit rules](https://www.gnu.org/software/bash/manual/html_node/The-Set-Builtin.html); sanitizer container options account for Docker's [seccomp restrictions on personality](https://docs.docker.com/engine/security/seccomp/). Review rounds are recorded in [the review log](2026-10-11-binance-lob-capture-review.md).
 
 ## Review Focus
 
@@ -145,6 +147,7 @@ TEST(Decimal, OverflowBoundary) { std::int64_t v{};
     - `class CsvRow`:
       - `explicit CsvRow(OutputFile&)`;
       - `CsvRow& integer(std::int64_t)`, `CsvRow& character(char)`, `CsvRow& text(std::string_view)` (quoted iff it contains `,` `"` CR LF; `"` → `""`);
+       - `CsvRow& unsigned_integer(std::uint64_t)` — for conn_seq and seqNo without narrowing; shares the 20-byte to_chars scratch.
       - `void end()` — writes `\n`;
       - inserts the separators itself.
     - `bool needs_quoting(std::string_view) noexcept`.
@@ -165,6 +168,7 @@ TEST(CsvWriter, QuotesOnlyWhenNeeded) {
 }
 TEST(CsvWriter, EmbeddedNewlineAndCr) { /* text("a\nb") -> "\"a\nb\"", text("a\rb") quoted */ }
 TEST(CsvWriter, NegativeAndZero) { /* integer(0) -> "0", integer(INT64_MIN) -> "-9223372036854775808" */ }
+TEST(CsvWriter, UnsignedBoundary) { /* unsigned_integer(UINT64_MAX) -> "18446744073709551615" */ }
 TEST(CsvWriter, FailedWriteIsSticky) { /* create on /dev/full (Linux only, GTEST_SKIP elsewhere):
   write + flush -> false; failed() == true; close() == false */ }
 ```
@@ -194,6 +198,8 @@ TEST(CsvWriter, FailedWriteIsSticky) { /* create on /dev/full (Linux only, GTEST
 TEST(CsvReader, CrlfAndNoFinalNewline) { /* "a,b\r\n\"x,\"\"y\"\"\",2" -> {"a","b"}, {"x,\"y\"","2"} */ }
 TEST(CsvReader, TrailingBlankLinesIgnored) { /* "a\n\n\n" -> one row */ }
 TEST(CsvReader, EmbeddedNewlineInQuotes) { /* "\"l1\nl2\",z\n" -> {"l1\nl2","z"} */ }
+TEST(CsvReader, FieldViewsSurviveRowGrowth) { /* small metadata fields followed by a 3 MiB quoted final field;
+  all returned views equal their fields after growth; establish views only after final row storage is stable */ }
 TEST(CsvReader, UnterminatedQuoteThrowsWithLine) { /* "a\n\"b\n" -> CsvFormatError, line()==2 */ }
 ```
 
@@ -230,6 +236,7 @@ TEST(CsvReader, UnterminatedQuoteThrowsWithLine) { /* "a\n\"b\n" -> CsvFormatErr
       `void set_log_allocation_hook(LogAllocationHook) noexcept;` — `log()` calls the hook with
       `true` before formatting and `false` after. The allocation test (Task 19) installs it to
       pause its counter; production leaves it null.
+     - `using LogFormatter = void (*)(std::ostream&, const void*);` and `void log_formatted(LogLevel, LogFormatter, const void* context) noexcept;` — accepts a stack-owned context and a non-capturing formatter, invoked synchronously inside the logger's allocation-hook scope. Callers never build a message string first. A scope guard restores the hook on every exit; formatting errors are caught inside the logger. Task 19 uses this for mismatch diagnostics containing both level sets.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -273,7 +280,7 @@ TEST(Options, UsageErrors) { /* each throws UsageError:
 - [ ] **Step 1:** Run `clang-format -i` over `src/` and `tests/`, and check that `git diff` shows formatting only.
 - [ ] **Step 2: Add the `format` job.** It installs `git` (so `actions/checkout` produces a real repository) and `clang-format-15` in `ubuntu:22.04`, then runs `clang-format-15 --dry-run --Werror $(git ls-files '*.cpp' '*.hpp' '*.hpp.in' ':!:third_party/**')`. The pathspec excludes vendored code from the start.
 - [ ] **Step 3: Add the `asan-ubsan` job.**
-  - Install the README packages, set `CXX=g++-12` (every CI job sets `CXX` explicitly from now on), configure with `cmake --preset asan`, build, and run `./build/asan/tests/unit_tests`. The job uses `options: --cap-add=SYS_PTRACE` (LeakSanitizer and, later, `strace` need it) and `BLC_TEST_TIME_SCALE=10`.
+   - Install the README packages plus `util-linux`, set `CXX=g++-12` (every CI job sets `CXX` explicitly from now on), configure with `cmake --preset asan`, build, and run `./build/asan/tests/unit_tests`. The job uses `options: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined` (tracing and the `setarch -R` fallback) and `BLC_TEST_TIME_SCALE=10`.
   - Switch `gtest_discover_tests` to `DISCOVERY_MODE PRE_TEST` in `tests/CMakeLists.txt`, so discovery never runs a sanitized binary at build time.
   - Make the existing `gcc-12` job run `unit_tests` as a non-root user (`useradd -m tester && su tester -c ./build/tests/unit_tests`), so permission tests execute.
   - Environment: `ASAN_OPTIONS=detect_leaks=1:abort_on_error=1` and `UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`.
@@ -292,14 +299,14 @@ TEST(Options, UsageErrors) { /* each throws UsageError:
 - Modify: root `CMakeLists.txt` (`add_subdirectory(third_party/simdjson)` before `src`), `src/CMakeLists.txt` (`blc_core` links `simdjson`)
 
 - [ ] **Step 1: Fetch** `singleheader/simdjson.h`, `singleheader/simdjson.cpp` and `LICENSE` from tag `v4.6.11` (`https://raw.githubusercontent.com/simdjson/simdjson/v4.6.11/...`). Write `VERSION` with `4.6.11` and the three files' SHA-256 values.
-- [ ] **Step 2: Add the target.** `add_library(simdjson STATIC simdjson.cpp)`, include directory marked `SYSTEM`, `SIMDJSON_EXCEPTIONS=0` as a PUBLIC definition. Build it with the README command: `cmake -B build-r -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wall -Wextra -O2" && cmake --build build-r 2>&1 | grep -c "warning:"`. Expected: `0`. If it is not 0, add `target_compile_options(simdjson PRIVATE -w)` with a comment explaining that it is vendored code, then re-check.
+- [ ] **Step 2: Add the target.** `add_library(simdjson STATIC simdjson.cpp)`, SYSTEM include directory and PUBLIC `SIMDJSON_EXCEPTIONS=0`. Configure with `cmake -B build-r -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wall -Wextra -O2"`. In a strict Bash subprocess (`set -euo pipefail`), build through `cmake --build build-r 2>&1 | tee build-r.log`, then `if grep -q 'warning:' build-r.log; then exit 1; fi`. Expected: exit 0 and no warnings; compilation failures must also fail. If vendored code warns, add PRIVATE `-w` with a reason and repeat. Regression-check the assertion on warning/no-warning logs; never interpret grep-c's zero-match exit 1 as a failed clean build.
 - [ ] **Step 3: Add a smoke test** `tests/simdjson_smoke_test.cpp`: parse `{"a":1}` with On-Demand and expect `a == 1`. Run it: PASS.
 - [ ] **Step 4: Commit** — `git commit -m "Vendor simdjson 4.6.11"`
 
 ### Task 8: Stream table and envelope split
 
 **Files:**
-- Create: `src/blc/parse/stream_table.hpp`, `src/blc/parse/stream_table.cpp`, `src/blc/parse/envelope.hpp`, `src/blc/parse/envelope.cpp`
+- Create: `src/blc/parse/stream_table.hpp`, `src/blc/parse/stream_table.cpp`, `src/blc/parse/envelope.hpp`, `src/blc/parse/envelope.cpp`, `src/blc/parse/json_consumer.hpp`, `src/blc/parse/json_workspace.hpp`, `src/blc/parse/json_workspace.cpp`
 - Test: `tests/parse_envelope_test.cpp`, `tests/parse_stream_table_test.cpp`
 
 **Interfaces:**
@@ -312,10 +319,13 @@ TEST(Options, UsageErrors) { /* each throws UsageError:
     - `void append_stream_list(std::string& out) const;` — `"btcusdt@depth@100ms/btcusdt@depth5@100ms/btcusdt@trade/…"`.
     - Storage: a sorted vector with binary search over `string_view`.
   - `struct Envelope { std::string_view stream; std::string_view data; };`
+   - `consume_json_value` in `json_consumer.hpp`: a bounded, allocation-free On-Demand visitor. Recursively visit all object fields/array elements, validate strings via get_string and booleans/null via their getters. Validate number tokens against the JSON number grammar without numeric conversion, then let the enclosing iterator advance that validated scalar. Never silently skip a container or unvalidated scalar; bound nesting to 128 and check iterator errors. Unknown values can contain valid huge numbers without changing CSV integer values.
+   - `class JsonWorkspace`: one padded 1 MiB scratch plus preallocated parser; `bool object(std::string_view, std::optional<std::int64_t>* root_error_code = nullptr) noexcept;` validates the complete object using that visitor and at_end. When requested, decode a unique root `code` integer, leaving the optional empty if absent, duplicated or non-integer. This does not add a second parser allocation to EnvelopeSplitter.
   - `class EnvelopeSplitter`:
-    - `EnvelopeSplitter();` — reserves a 1 MiB + padding scratch and an On-Demand parser.
+     - `EnvelopeSplitter();` — constructs its sole JsonWorkspace; no additional scratch/parser. Envelope fallback reuses that workspace's parser/storage after syntax validation.
     - `bool split(std::string_view frame, Envelope& out) noexcept;`
     - `std::uint64_t fallbacks() const noexcept;`
+     - `JsonWorkspace& json_workspace() noexcept;` — its owned workspace is also reused by REST transport, serially on the io thread. Every frame first receives full syntax validation before the fast extraction scan or envelope fallback. Invalid inner JSON is a frame loss; syntactically valid payloads with wrong/missing event fields are saved and handled by Processor. This extra network validation pass is deliberate: it keeps invalid JSON out of the audit CSV. Typed events are decoded once on the processor.
     - Exactly one splitter exists per process. It is owned by the capture app and used only on
       the io thread, which is single-threaded, so all `FrameRouter`s share it. Per-shard
       splitters would cost 64 × (1 MiB scratch + parser), outside the §9 budget.
@@ -337,10 +347,18 @@ TEST(StreamTable, LookupAndList) { /* symbols BTCUSDT, ETHUSDT, first index 3:
   find("ethusdt@depth5@100ms") == {4, Depth5}; find("ethusdt@depth@100ms") == {4, DepthDiff};
   find("btcusdt@aggTrade") == nullopt; list ==
   "btcusdt@depth@100ms/btcusdt@depth5@100ms/btcusdt@trade/ethusdt@depth@100ms/ethusdt@depth5@100ms/ethusdt@trade" */ }
+TEST(Envelope, FastPathRejectsDuplicateAndTrailingFields) { /* each false:
+  {"stream":"btcusdt@trade","data":{},"data":{}};
+  {"stream":"btcusdt@trade","data":{},"stream":"other"};
+  escaped quotes/braces inside data strings must still split correctly */ }
+TEST(Envelope, InvalidInnerJsonIsRejected) { /* balanced envelopes containing data {"x":nul}, {"x":[1,]},
+  or an invalid string escape are false on forward/reversed layouts; valid huge unknown numbers are accepted */ }
+TEST(Envelope, WorkspaceValidatesAndExtractsRootErrorCode) { /* valid object root code -1121 -> optional -1121;
+  absent, duplicate, nested-only or non-integer code -> empty; invalid JSON -> false; trailing content rejected */ }
 ```
 
 - [ ] **Step 2: Run** `--gtest_filter='Envelope*:StreamTable*'`. Expected: FAIL.
-- [ ] **Step 3: Implement** the fast path and fallback exactly as in §6.2. The fallback is one pass over the object's fields with key dispatch, each key at most once, and `data` taken through `raw_json()` (which must be an object). It returns views into the scratch copy.
+- [ ] **Step 3: Implement** §6.2. The fast scan tracks strings, escapes and object/array nesting to find the end of the single `data` object; it accepts only an immediately following outer `}` and end of frame. Additional outer fields, duplicate keys or unusual whitespace go through the fallback. The fallback is one pass over fields with key dispatch, each required key exactly once, and `data` taken through `raw_json()` (an object). It returns views into the scratch copy.
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Add stream table and envelope splitter"`
 
@@ -349,6 +367,7 @@ TEST(StreamTable, LookupAndList) { /* symbols BTCUSDT, ETHUSDT, first index 3:
 **Files:**
 - Create: `src/blc/parse/events.hpp`, `src/blc/parse/payload_parser.hpp`, `src/blc/parse/payload_parser.cpp`
 - Create fixtures: `tests/fixtures/payloads/{spot,usdm}_{diff,depth5,trade,snapshot}.json` (real payloads; see Step 1)
+- Create: `tests/support/paths.hpp.in`; modify `tests/CMakeLists.txt` to configure it into the build tree and expose the generated include directory.
 - Test: `tests/parse_payload_test.cpp`
 
 **Interfaces:**
@@ -380,7 +399,8 @@ TEST(StreamTable, LookupAndList) { /* symbols BTCUSDT, ETHUSDT, first index 3:
     - usdm depth5: `u` is the id, `b`, `a`, `s`;
     - trade: `m`, `s`;
     - snapshot: `lastUpdateId`, `bids`, `asks`;
-    - unknown keys are skipped, required keys must appear exactly once, and the document must reach `at_end()`.
+     - unknown values are consumed and validated with Task 8's visitor during the same traversal; required keys appear exactly once and the document reaches at_end. Reaching the end alone is not full validation. Payload nesting beyond 128 is Oversized.
+     - Event-domain validation: every price is positive; diff quantities may be zero (deletion), while snapshot/depth5 quantities are positive. Snapshot/depth5 sides have unique prices in strict best-first order; diff ranges satisfy U<=u. Violations are Malformed before an event can mutate the book. Empty snapshot/depth5 sides are allowed and retain their existing completeness/padding rules.
 
 - [ ] **Step 1: Capture fixtures** with a throwaway script (not committed): one real frame's `data` object per venue and kind from the live streams (BTCUSDT), plus `curl` depth snapshots with `limit=5` (small). Store them minified under `tests/fixtures/payloads/`.
 - [ ] **Step 2: Write failing tests**
@@ -392,6 +412,11 @@ TEST(Payload, SpotDepth5IdIsLastUpdateId) { /* id == lastUpdateId; n_bids == 5 *
 TEST(Payload, UsdmDepth5IdIsU) { /* id == fixture "u", even though e == "depthUpdate" */ }
 TEST(Payload, TradeMaker) { /* spot fixture m:true -> buyer_is_maker true */ }
 TEST(Payload, FieldOrderIndependent) { /* reorder keys of the spot diff -> identical DepthDiff */ }
+TEST(Payload, InvalidIgnoredValuesRejected) { /* otherwise valid diff with ignored "E":nul,
+  unknown invalid string escape, or "extra":[1,] -> Malformed; nested valid unknown values -> Ok;
+  nesting over 128 -> Oversized; no allocation/capacity growth */ }
+TEST(Payload, InvalidLevelDomainsRejected) { /* zero price, snapshot/depth5 zero quantity, duplicate or
+  wrongly ordered snapshot/depth5 prices, and U>u -> Malformed; diff qty zero remains valid deletion */ }
 TEST(Payload, Errors) { /* missing "u" -> Malformed; duplicate "U" -> Malformed; a diff level ["1e5","1"] -> BadDecimal;
   "s":"ETHUSDT" for BTCUSDT -> SymbolMismatch; level ["1"] -> Malformed; trailing "}x" -> Malformed;
   depth5 with 6 bids -> Malformed */ }
@@ -471,6 +496,8 @@ TEST(Coverage, ExhaustionAfterDeletes) { /* snapshot bids 2000..1001 (1000 level
 TEST(Coverage, TrimCompleteSideRevokesCompleteness) { /* complete side grows to 5001 via diffs -> trimmed to 4000,
   complete == false, boundary == worst retained; then deleting down to 4 levels -> !authoritative (no zero padding) */ }
 TEST(Coverage, TrimBeyondBoundaryKeepsBoundary) { /* trimmed levels all worse than boundary -> boundary unchanged */ }
+TEST(Coverage, TrimInsideBoundaryMovesBoundary) { /* bounded side grows to 5001 trusted levels -> trim to 4000;
+  boundary becomes worst retained price, margin 4000; exercise both bids and asks */ }
 ```
 
 - [ ] **Step 2: Run** `--gtest_filter='Coverage*'`. Expected: FAIL.
@@ -513,11 +540,13 @@ TEST(Sequence, SpotBoundaries) { EXPECT_EQ(classify(Venue::Spot, 106, 110, 0, 10
   EXPECT_EQ(classify(Venue::Spot, 100, 105, 0, 105), SeqClass::Stale); }
 TEST(Sequence, UsdmUsesPu) { EXPECT_EQ(classify(Venue::Usdm, 120, 130, 105, 105), SeqClass::Continues);
   EXPECT_EQ(classify(Venue::Usdm, 120, 130, 104, 105), SeqClass::Gap); }
+TEST(Sequence, UsdmStaleWinsOverWrongPu) { /* u<=ref -> Stale even when pu!=ref */ }
 TEST(Sequence, Bridges) { EXPECT_TRUE(bridges(Venue::Spot, 101, 105, 100)); EXPECT_FALSE(bridges(Venue::Spot, 102, 105, 100));
   EXPECT_TRUE(bridges(Venue::Usdm, 95, 105, 100)); EXPECT_FALSE(bridges(Venue::Usdm, 101, 105, 100));
   EXPECT_TRUE(contained_in_snapshot(Venue::Spot, 100, 100)); EXPECT_FALSE(contained_in_snapshot(Venue::Usdm, 100, 100)); }
 TEST(DiffWindow, OverlapAppendedNotReset) { /* [100,105] then [103,108] -> Appended, size 2 */ }
 TEST(DiffWindow, GapResets) { /* then [110,112] -> Reset, size 1 */ }
+TEST(DiffWindow, StaleLeavesWindowUnchanged) { /* same/older u -> Stale, unchanged content/capacity, both venues */ }
 TEST(DiffWindow, TrimsOldestByLevels) { /* 3 diffs of 9 000 levels each -> first dropped, trimmed()==1 */ }
 TEST(DiffWindow, TrimsOldestByCount) { /* 2 001 one-level diffs -> size 2000 */ }
 TEST(DiffWindow, WrapAroundPreservesContent) { /* after wrapping, at(i) levels equal inputs */ }
@@ -540,8 +569,8 @@ TEST(DiffWindow, ArenaKeepsDiffContiguous) { /* a diff that would straddle the a
 - Consumes: `OrderBook`, `Depth5`, `DiffView`.
 - Produces:
   - `enum class CheckResult { Verified, PartiallyVerified, Mismatch };`
-  - `CheckResult full_check(const OrderBook&, const Depth5&) noexcept;`
-  - `CheckResult partial_check(const OrderBook&, const Depth5&, const DiffView& d, std::size_t& levels_unchecked) noexcept;` — compares only prices inside the depth5 range ∩ coverage and not touched by `d` (§5.6).
+   - `CheckResult full_check(const OrderBook&, const Depth5&, std::size_t& levels_compared) noexcept;`
+   - `CheckResult partial_check(const OrderBook&, const Depth5&, const DiffView& d, std::size_t& levels_unchecked, std::size_t& levels_compared) noexcept;` — compares only prices inside the depth5 range ∩ coverage and untouched by d. Initialise counts to zero and count actual non-padding level comparisons, including those before an early mismatch. A partial check with no comparable levels reports zero, never evidence of validation.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -553,6 +582,8 @@ TEST(Depth5Check, PartialBeyondCoverageNotCompared) {
   // depth5 bids 9,8,7,6,5 -> PartiallyVerified, levels_unchecked == 1 (price 5)
 }
 TEST(Depth5Check, PartialDetectsUntouchedDifference) { /* untouched price 8 qty differs -> Mismatch */ }
+TEST(Depth5Check, ComparedCountsExcludeUncheckedAndPadding) { /* full/partial successes and early mismatches
+  count actual levels; all touched/outside-coverage partial check has levels_compared==0 */ }
 ```
 
 - [ ] **Step 2: Run** `--gtest_filter='Depth5Check*'`. Expected: FAIL.
@@ -572,7 +603,7 @@ TEST(Depth5Check, PartialDetectsUntouchedDifference) { /* untouched price 8 qty 
   - `enum class SyncState { Unsynced, Synced };`
   - `enum class UnsyncCause { NewEpoch, Gap, DiffParseError, Oversized, CoverageExhausted, Depth5Mismatch };`
   - `struct Emit { bool row = false; char type = 0; char side = 'N'; };` — the processor maps it to a CSV row.
-  - `struct SymbolCounters { std::uint64_t stale_diffs, gaps, resets, syncs, resyncs, snapshot_too_old, coverage_exhausted, window_resets, depth5_verified, depth5_partially_verified, depth5_mismatch, depth5_stale, depth5_unchecked, depth5_levels_unchecked, parse_errors, oversized_events, epoch_regressions; };`
+   - `struct SymbolCounters` — zero-initialised `std::uint64_t` fields: `stale_diffs, gaps, resets, syncs, resyncs, snapshot_too_old, coverage_exhausted, window_resets, window_trimmed, depth5_verified, depth5_partially_verified, depth5_mismatch, depth5_stale, depth5_unchecked, depth5_levels_unchecked, parse_errors, oversized_events, epoch_regressions, refresh_ok, refresh_mismatch`. Refresh fields stay zero until Task 33. Window trims are counted from `DiffWindow::trimmed()` deltas.
   - `enum class Depth5Policy { Resync, CountOnly };` and `constexpr Depth5Policy depth5_policy(Venue) noexcept;` — both venues `Resync` (§5.6, §15).
   - `class SymbolBook`:
     - `SymbolBook(Venue, SymbolCounters&);` delegates to `SymbolBook(Venue, SymbolCounters&, Depth5Policy);`. A default argument cannot name another parameter; the second constructor lets tests exercise `CountOnly`.
@@ -583,13 +614,14 @@ TEST(Depth5Check, PartialDetectsUntouchedDifference) { /* untouched price 8 qty 
     - `Emit on_depth5(const Depth5&) noexcept;`
     - `Emit on_trade(const Trade&, bool trade_rows) noexcept;`
     - `Emit on_snapshot(const DepthSnapshot&) noexcept;` — clears the outstanding mark first.
-    - `Emit on_snapshot_error() noexcept;` — a snapshot record that failed to parse or was `Oversized`: counts it, clears the outstanding mark, and wants a new snapshot if still Unsynced.
+     - `Emit on_snapshot_error(bool oversized) noexcept;` — increments `parse_errors`, plus `oversized_events` when true, clears the outstanding mark, and requests again if still Unsynced. `on_diff_error(Oversized)` also increments both. Processor counts malformed depth5/trade payloads without invoking the diff-error transition.
     - `bool snapshot_wanted() const noexcept;` — true only when a snapshot is needed **and** none is outstanding (§5.4 step 5).
     - `void mark_requested() noexcept;` — sets the outstanding mark. It is cleared only by `on_snapshot`, `on_snapshot_error` or an epoch reset.
     - `void enter_unsynced(UnsyncCause) noexcept;` — per the §5.7 table.
     - `SyncState state() const noexcept;`
     - `const OrderBook& book() const noexcept;`
   - The pending snapshot and pending depth5 check are owned copies, reserved at construction.
+   - Add zero-initialised counters `depth5_full_checks`, `depth5_partial_checks`, `depth5_full_levels_compared`, `depth5_partial_levels_compared`. Count attempts by resolution path and add the checker's actual compared count regardless of success/mismatch. Include them in stats/final summaries. They prove live checks are non-vacuous, including a documented CountOnly fallback.
 
 - [ ] **Step 1: Write failing tests** — one per bullet, built from small hand-written diffs and snapshots:
 
@@ -614,7 +646,12 @@ TEST(Sync, DiffParseErrorIsGap) { /* synced; on_diff_error(DiffParseError) -> Un
 TEST(Sync, CoverageExhaustionDropsPendingCheck) { /* p>id pending; the next diff exhausts coverage -> Unsynced, no depth5 check counted */ }
 TEST(Sync, NoDuplicateRequestWhileOutstanding) { /* Unsynced, mark_requested(); a diff parse error -> snapshot_wanted()==false;
   on_snapshot(too old) -> snapshot_wanted()==true */ }
-TEST(Sync, SnapshotErrorRerequests) { /* mark_requested(); on_snapshot_error() -> snapshot_wanted()==true */ }
+TEST(Sync, SnapshotErrorRerequests) { /* mark_requested(); on_snapshot_error(false) -> snapshot_wanted()==true;
+  true additionally counts oversized_events, without double-counting parse_errors */ }
+TEST(Sync, Depth5StaleAndPendingReplacementCounted) { /* p<book.id -> depth5_stale++;
+  replacing an unresolved pending check -> depth5_unchecked++; only the newer check may resolve */ }
+TEST(Sync, OversizedDiffCountsAndResets) { /* on_diff_error(Oversized) clears window/pending check,
+  enters Unsynced without a row; parse_errors and oversized_events each increase once */ }
 TEST(Sync, CountOnlyPolicyDoesNotResync) { /* Depth5Policy::CountOnly; mismatch -> depth5_mismatch==1, still Synced, row emitted */ }
 ```
 
@@ -633,7 +670,7 @@ TEST(Sync, CountOnlyPolicyDoesNotResync) { /* Depth5Policy::CountOnly; mismatch 
 - Produces (test support only):
   - `class ExchangeSim`:
     - `ExchangeSim(Venue, std::uint32_t seed);`
-    - `struct Step { enum Kind { Diff, Depth5, Trade, Snapshot, Reconnect } kind; DepthDiff diff; Depth5 d5; DepthSnapshot snap; };`
+     - `struct Step { enum Kind { Diff, Depth5, Trade, Snapshot, Reconnect } kind; std::uint32_t epoch; DepthDiff diff; Depth5 d5; DepthSnapshot snap; };`
     - `Step next();` — random walk around a mid price, with deep resting levels that are never touched.
     - `TopOfBook true_top() const;`
     - `void inject_gap();` — the next diff skips ids. `void inject_reconnect();` — the next step is `Reconnect`.
@@ -641,13 +678,14 @@ TEST(Sync, CountOnlyPolicyDoesNotResync) { /* Depth5Policy::CountOnly; mismatch 
     - The simulator keeps each true side ≤ 4 000 levels, so trimming never occurs here (it is unit-tested in Task 11).
   - Snapshots are truncated to 1 000 levels. usdm ids skip values, and `pu` chains. Gaps and reconnects are injected at random (about 1 per 2 000 steps).
 
-- [ ] **Step 1: Write the test.** For seeds 1..20 and both venues, run 10⁴ steps each, feeding `SymbolBook` and requesting snapshots when `snapshot_wanted()`. The simulator answers snapshot requests two steps later. Assert after every step:
+- [ ] **Step 1: Write the test.** For seeds 1..20 and both venues, run 10⁴ steps each through `SymbolBook`, requesting snapshots when wanted. Capture snapshot contents at request time and deliver two steps later with the requesting epoch. A reconnect increments the epoch and discards old-epoch responses before they reach the book, matching FrameRouter delivery rules; the new epoch's first record requests again. Pin request→reconnect→old-response in a deterministic test. Assert after every step:
   - **No wrong output:** if a row was emitted, `book.top5()` equals `sim.true_top()`.
-  - **Exhaustion matches the oracle:** the book enters Unsynced with cause `CoverageExhausted` at step *k* exactly when `coverage_sufficient(last served snapshot)` turns false at *k*.
+   - **Exhaustion matches the oracle:** during a Synced interval, track the snapshot that established the book (not an unaccepted or old-epoch response). A continuous diff enters Unsynced with cause `CoverageExhausted` exactly when `coverage_sufficient(accepted snapshot)` turns false. Gap/reconnect intervals are checked separately, not counted as coverage failures.
   - **No needless suppression:** a market record may go without a row only while the book is in an *unsynced interval*. Such an interval opens at the start or at any `enter_unsynced` (any cause) and closes when the book is Synced again. Any row withheld outside an interval fails the test, with the seed and step number.
   - **Liveness:** within each interval, once a snapshot has been served, the book is Synced at the first diff that bridges it. The simulator knows which diff that is, regardless of how many depth5 or trade steps come in between.
-  - **Consistency:** `depth5_mismatch == 0` across all seeds, and `syncs == 1 + (number of Synced → Unsynced transitions)` per run. Gaps or reconnects injected while the book is already Unsynced add no transition.
-- [ ] **Step 2: Run** `--gtest_filter='BookProperty*'`. Expected: PASS. A failure is a real bug: fix it in Tasks 10–14 code with a regression test, never in the simulator.
+     If the bridging diff and contiguous suffix are already buffered, sync must complete on the snapshot record itself. Pin both completion routes. Add a deterministic independent depletion/recovery run: the served snapshot's trusted region falls below five while deeper true levels still exist; require at least one observed coverage exhaustion and successful resync, so the oracle cannot pass vacuously because of untouched resting levels.
+   - **Consistency:** `depth5_mismatch == 0`, and `syncs == (Synced → Unsynced transitions) + (final state == Synced ? 1 : 0)`. Gaps/reconnects while already Unsynced add no transition. Pin runs ending before initial sync and during final resync.
+- [ ] **Step 2: Run** `--gtest_filter='BookProperty*'`. Expected: PASS. Investigate against the design and independent exchange state. Correct production defects with regression tests; correct a demonstrably wrong oracle with an independent example. Never change expectations merely to make production pass.
 - [ ] **Step 3: Commit** — `git commit -m "Add exchange-simulator property test for the book"`
 
 ---
@@ -658,7 +696,7 @@ TEST(Sync, CountOnlyPolicyDoesNotResync) { /* Depth5Policy::CountOnly; mismatch 
 
 **Files:**
 - Create: `src/blc/pipeline/record.hpp`, `src/blc/pipeline/spsc_ring.hpp`, `src/blc/pipeline/spsc_ring.cpp`
-- Modify: `.github/workflows/ci.yml` (add the `tsan` job: `cmake --preset tsan`, run `unit_tests`)
+- Modify: `.github/workflows/ci.yml` (add `tsan`: `CXX=g++-12`, configure/build/run `unit_tests`, `BLC_TEST_TIME_SCALE=10`, `options: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined`, `util-linux` installed, and Task 6's diagnosed `setarch -R` fallback)
 - Test: `tests/pipeline_spsc_ring_test.cpp`
 
 **Interfaces:**
@@ -677,6 +715,7 @@ TEST(Sync, CountOnlyPolicyDoesNotResync) { /* Depth5Policy::CountOnly; mismatch 
     - `bool producer_closed() const noexcept;`
     - `void wait(std::chrono::milliseconds) noexcept;` — spins, then parks.
     - `std::size_t high_water() const noexcept;`
+     - `std::size_t capacity() const noexcept;`
   - Records are 64-byte aligned and followed by `SIMDJSON_PADDING`; a wrap marker is used when needed (§6.4).
 
 - [ ] **Step 1: Write failing tests**
@@ -708,7 +747,7 @@ TEST(SpscRing, TwoThreadStress) { /* producer pushes 10^6 sequence-numbered reco
 - Consumes: `StreamTable`, `EnvelopeSplitter`, `SpscRing`, `RecordHeader`.
 - Produces:
   - `metrics.hpp`:
-    - `struct IoMetrics` — relaxed atomics: `frames_received`, `bytes_received`, `malformed_frames`, `ring_drops`, `shard_losses`, `snapshots_discarded`, `connects`, `reconnects`, `connect_failures`, `connect_throttled`, `rest_requests`, `rest_failures`, `rest_cooldowns`, `rest_weight_used`.
+     - `struct IoMetrics` — zero-initialised relaxed atomic counters: `frames_received`, `bytes_received`, `malformed_frames`, `ring_drops`, `shard_losses`, `snapshots_discarded`, `connects`, `reconnects`, `connect_failures`, `connect_throttled`, `rest_requests`, `rest_failures`, `rest_cooldowns`, `rest_weight_used`; fixed arrays for per-stream frame/byte counts; plus `receive_capacity_bytes`, updated on the io thread with the sum of all shard receive-buffer capacities.
     - `struct EpochStats { std::uint64_t frames, malformed, drops; };`
   - `class FrameRouter`:
     - `FrameRouter(std::uint16_t shard, const StreamTable&, EnvelopeSplitter& shared, SpscRing&, IoMetrics&);` — the splitter is the process-wide one (Task 8).
@@ -718,7 +757,7 @@ TEST(SpscRing, TwoThreadStress) { /* producer pushes 10^6 sequence-numbered reco
     - `bool lost() const noexcept;`
     - `void on_disconnected() noexcept;` — called by `WsShard` on any read error, close or loss. It clears the `established` flag.
     - `bool can_deliver_snapshot(std::uint32_t epoch) const noexcept;` — `epoch` is current, the connection is established, and there has been no loss (§6.3).
-    - `bool push_snapshot(std::uint16_t symbol, std::uint32_t epoch, std::string_view body, std::int64_t recv_ns) noexcept;` — false if the ring is full.
+     - `bool push_snapshot(std::uint16_t symbol, std::uint32_t epoch, std::string_view body, std::int64_t recv_ns, std::int64_t steady_ns) noexcept;` — false if the ring is full; preserve response-receive steady time across retries.
     - `EpochStats close_epoch() noexcept;` — the caller logs the `epoch_closed` line.
 
 - [ ] **Step 1: Write failing tests**
@@ -731,6 +770,8 @@ TEST(FrameRouter, RingFullIsLoss) { /* tiny ring; push fails -> LostNow; can_del
 TEST(FrameRouter, NoDeliveryAfterDisconnect) { /* on_connected(0); on_disconnected(); can_deliver_snapshot(0) == false;
   on_connected(1) -> can_deliver_snapshot(1) == true, can_deliver_snapshot(0) == false */ }
 TEST(FrameRouter, NewConnectionClearsLoss) { /* on_connected(1) -> not lost; conn_seq restarts at 0 */ }
+TEST(FrameRouter, SnapshotSteadyTimeSurvivesRingRetry) { /* full ring -> snapshot push false; pop then retry
+  using the same original recv_ns/steady_ns -> both timestamps unchanged in the resulting RecordHeader */ }
 TEST(FrameRouter, AccountingInvariant) { /* frames == pushed + malformed + drops for the closed epoch */ }
 TEST(FrameRouter, ReversedEnvelopeSameRecord) { /* {"data":…,"stream":…} and the forward form of the same frame push
   records with identical header fields and payload bytes */ }
@@ -798,11 +839,13 @@ TEST(OutputFiles, SharedSidecarScratchKeepsRowsSeparate) { /* two SymbolFiles ov
     - `class RequestSlots final : public SnapshotRequester` — one `std::atomic<std::uint64_t>` per symbol holding `(epoch << 32) | request_number`; request numbers start at 1. `template <class F> void scan(F&& on_changed);` is for the io thread.
     - `class NullRequester final : public SnapshotRequester`.
   - `class SymbolOutput` (interface, `processor.hpp`):
-    - `virtual void market_row(const RecordView&, std::string_view payload_minified) = 0;`
-    - `virtual void snapshot_row(const RecordView&, std::size_t apply_before_row) = 0;`
-    - `virtual void book_row(std::int64_t recv_ns, std::uint64_t seq, std::int32_t id, Emit, const TopOfBook&) = 0;`
-    - `virtual std::size_t market_rows() const = 0;`
-    - `virtual bool failed() const = 0;`
+     - `virtual ~SymbolOutput() = default;`
+     - `virtual void market_row(const RecordView&, std::string_view payload_minified) noexcept = 0;`
+     - `virtual void snapshot_row(const RecordView&, std::size_t apply_before_row, std::string_view payload_minified) noexcept = 0;`
+     - `virtual void book_row(std::int64_t recv_ns, std::uint64_t seq, std::int32_t id, Emit, const TopOfBook&) noexcept = 0;`
+     - `virtual std::size_t market_rows() const noexcept = 0;`
+     - `virtual bool failed() const noexcept = 0;`
+     - `virtual bool flush() noexcept = 0;` and `virtual bool finish() noexcept = 0;` — finish flushes/closes all owned files, checks every result without short-circuiting, and is idempotent. Failure stays sticky. Both real implementations and test doubles implement this lifecycle.
     - Implementations: `FileOutput` (capture: all three files) and `BookOnlyOutput` (replay).
   - `struct ProcessorConfig { Venue venue; std::vector<SymbolSpec> symbols; bool trade_rows = true; };`
   - `class Processor`:
@@ -812,9 +855,9 @@ TEST(OutputFiles, SharedSidecarScratchKeepsRowsSeparate) { /* two SymbolFiles ov
     - `void flush() noexcept;`
     - `bool finish() noexcept;` — flush and close, checked.
     - `const SymbolCounters& counters(std::size_t symbol) const;`
-    - `ProcessorStats stats() const;` — processor counters summed over symbols, `retained_bytes()` (the capacity sum of every processor and per-symbol container), and the latency histogram.
+     - `ProcessorStats stats() const;` — zero-initialised row/minify counters, every `SymbolCounters` field summed over symbols, `retained_bytes()` (processor/per-symbol containers and buffers, excluding ring/network), and the latency histogram.
   - `class LatencyHistogram` — fixed log2 buckets (64), `void add(std::int64_t ns) noexcept`, `std::int64_t percentile(double p) const noexcept` (bucket upper bound). The processor adds `wall steady now − header.steady_ns` per record after its row is written; replay records carry no steady time and add nothing.
-  - `std::string format_stats(const ProcessorStats&, const IoMetrics* io, std::size_t ring_hw_bytes, std::int64_t uptime_s);` — the §8 `key=value` line. `io == nullptr` (replay) omits io keys.
+   - `std::string format_stats(const ProcessorStats&, const IoMetrics* io, std::size_t ring_capacity_bytes, std::size_t ring_hw_bytes, std::int64_t uptime_s);` — §8 keys, including `syncs`, `snapshot_rows`, `window_trimmed`, minify and depth5 counters. `retained_kib` sums processor storage, ring capacity and `io->receive_capacity_bytes`. Null io (replay) omits io keys; replay passes zero ring arguments.
   - `row_format.hpp`: `void write_book_row(CsvRow&, std::int64_t recv_ns, std::uint64_t seq, std::int32_t id, char type, char side, const TopOfBook&);` — 26 columns.
 
 - [ ] **Step 1: Write failing tests**
@@ -829,9 +872,16 @@ TEST(Processor, PerSymbolEpochIsolation) { /* BTC epoch-1 record does not reset 
 TEST(Processor, WriterFailureSetsFatal) { /* SymbolOutput reporting failed() -> fatal(), later records ignored */ }
 TEST(Processor, PrettyPayloadMinified) { /* payload with spaces and newlines -> the market row holds the one-line minified
   form; payloads_minified==1; parsing still succeeds */ }
+TEST(Processor, PrettySnapshotMinified) { /* multiline snapshot -> one-line minified sidecar payload;
+  apply_before_row unchanged, parses and syncs normally */ }
+TEST(Processor, EpochRegressionIgnored) { /* epoch 2 then 1 -> epoch_regressions++; no rows/requests from regression */ }
+TEST(Processor, MalformedDepth5OrTradeDoesNotUnsync) { /* valid JSON missing a required field:
+  market row saved, parse_errors++; no book row/request; Synced book unchanged */ }
 TEST(Processor, StatsLineKeys) { /* format_stats with an IoMetrics contains every §8 key: frames md_rows ob_rows parse_errors gaps resyncs
   reconnects coverage_exhausted depth5_verified depth5_mismatch ring_drops ring_hw_kib retained_kib lat_p50_us lat_p99_us */ }
 TEST(LatencyHistogram, Percentiles) { /* 1..1000 us uniform -> p50 within its bucket bounds of 500 us; p99 >= p50; empty -> 0 */ }
+TEST(Processor, SnapshotLatencyUsesReceiveTime) { /* snapshot header carries steady_now-5s from a delayed
+  delivery; after its sidecar write histogram includes ≥5s, rather than measuring only processing time */ }
 TEST(Processor, RetainedBytesStable) { /* retained_bytes() equals its value at construction after 10^4 records (nothing grows) */ }
 TEST(LossIntegration, DroppedDiffThenTradeEmitsNoStaleRow) {
   // spec §13 'loss' scenario via write_loss_scenario(tmp): FrameRouter -> tiny SpscRing -> Processor; ring full when a diff
@@ -839,14 +889,16 @@ TEST(LossIntegration, DroppedDiffThenTradeEmitsNoStaleRow) {
   // best bid; after on_connected(1) + new frames the symbol resyncs. The replay half of this scenario is in Task 21.
 }
 TEST(Allocations, ProcessorPathAllocatesNothing) {
+  // real FileOutput writers; prepare fixtures and record storage before arming;
   // counting operator new armed right after Processor construction (no warm-up);
-  // feed scenario-style records covering sync, gap, resync, coverage exhaustion, trimming, depth5 checks;
+  // cover both kinds, trades on/off, minification, sync, gap, resync, exhaustion, trimming,
+  // full/partial depth5 checks and mismatches with real rate-limited diagnostics;
   // EXPECT_EQ(allocations, 0)
 }
 ```
 
-- [ ] **Step 2: Run** `--gtest_filter='Processor*:LossIntegration*:Allocations*'`. Expected: FAIL.
-- [ ] **Step 3: Implement** the §6.5 steps. The minify scratch is 1 MiB. `tests/support/counting_allocator.cpp` replaces the global `operator new`/`delete` and installs `set_log_allocation_hook` (Task 5), so log formatting is not counted.
+- [ ] **Step 2: Run** `--gtest_filter='Processor*:LatencyHistogram*:LossIntegration*:Allocations*'`. Expected: FAIL.
+- [ ] **Step 3: Implement** §6.5. Reuse 1 MiB minify scratch for either record kind, consumed synchronously by output. The counting allocator replaces scalar/array/aligned global new/delete with thread-local counting on the processor thread; input generation and post-disarm assertions are outside measurement. Install Task 5's logger hook and format diagnostics through `log_formatted`, so all log formatting occurs inside its excluded scope. Task 33 adds refresh traffic if built.
 - [ ] **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Add processor, request slots, loss and allocation tests"`
 
@@ -859,7 +911,7 @@ TEST(Allocations, ProcessorPathAllocatesNothing) {
 **Interfaces:**
 - Consumes: `SpscRing` (Task 16), `Processor` (Task 19).
 - Produces:
-  - `struct ConsumerConfig { std::function<std::int64_t()> steady_now_ns; std::chrono::milliseconds flush_every{1000}; std::chrono::seconds stats_every{10}; std::function<void(const std::string&)> on_stats; };` — the clock is injectable, so tests don't sleep. `stats_every == 0s` means no periodic line, only the final summary (`--stats-interval 0`).
+   - `struct ConsumerConfig { std::function<std::int64_t()> steady_now_ns; std::int64_t started_at_ns; const IoMetrics* io; std::chrono::milliseconds flush_every{1000}; std::chrono::seconds stats_every{10}; std::function<void(const std::string&)> on_stats; };` — start is on the same injected clock; io points to process-lifetime atomics (null offline). Pass it, ring capacity/high-water and elapsed seconds to `format_stats`. `stats_every == 0s` disables periodic lines, retaining the final summary. Tests use an injectable clock and event acknowledgements.
   - `int run_consumer(SpscRing&, Processor&, std::atomic<int>& fatal_code, const ConsumerConfig&) noexcept;` — the processor thread's body, implementing §6.7 steps 4–5:
     - peek → `process` → `pop`;
     - when the ring is empty, `ring.wait(50 ms)`;
@@ -878,6 +930,8 @@ TEST(Consumer, WriterFailurePublishesFatalAndDrains) { /* failing SymbolOutput a
   records 4..N popped but not written, consumer returns 1 after close */ }
 TEST(Consumer, FinishFailureReturnsOne) { /* close() fails at finish -> 1 */ }
 TEST(Consumer, PeriodicFlushAndStatsFollowInjectedClock) { /* advance the fake clock 1 s -> flush; 10 s -> one stats line */ }
+TEST(Consumer, StatsIncludeIoMetricsAndUptime) { /* injected start/io -> correct elapsed seconds and io fields;
+  stats_every==0 -> no periodic line, one final summary */ }
 TEST(Consumer, ConcurrentProducerUnderTsan) { /* producer thread pushes 10^5 records then closes; consumer processes all; TSan clean */ }
 ```
 
@@ -889,7 +943,7 @@ TEST(Consumer, ConcurrentProducerUnderTsan) { /* producer thread pushes 10^5 rec
 ### Task 21: Replay mode and `blc_verify`
 
 **Files:**
-- Create: `src/blc/replay/replay.hpp`, `src/blc/replay/replay.cpp`, `tools/blc_verify.cpp`, `tools/CMakeLists.txt`
+- Create: `src/blc/replay/replay.hpp`, `src/blc/replay/replay.cpp`, `src/blc/verify/verify.hpp`, `src/blc/verify/verify.cpp`, `tools/blc_verify.cpp`, `tools/CMakeLists.txt`
 - Modify: `src/main.cpp` (dispatch `Mode::Replay` to `run_replay`), root `CMakeLists.txt` (`add_subdirectory(tools)`)
 - Test: `tests/replay_test.cpp`
 
@@ -897,15 +951,18 @@ TEST(Consumer, ConcurrentProducerUnderTsan) { /* producer thread pushes 10^5 rec
 - Consumes: `CsvReader`, `Processor`, `BookOnlyOutput`, `NullRequester`, `ReplayOptions`.
 - Produces:
   - `int run_replay(const ReplayOptions&);` — returns 0, 1 or 2 per §7.
+     - Preflight before output changes: skip order-book inputs, deduplicate the same canonical input path, and reject distinct market-data inputs with the same output basename (exit 2 naming both). Unreadable/missing files and header/name errors remain per-file failures: record them and continue preflight/processing for good inputs; canonicalisation failure must not abort the batch. Then prepare output and archive the complete planned good output set once. Same-day runs from different input directories cannot overwrite one another's replay output.
     - Venue and symbol come from the file name `market_data_<venue>_<SYMBOL>_<date>.csv`; every row must agree, or that file fails.
     - A header-only input replays to a header-only order book.
     - Stats lines print every `stats_interval_s` during long replays, and a per-file final summary (`format_stats` with `io == nullptr`) prints at the end.
-  - `blc_verify <file>...` detects the file type from its header and exits 0 or 1. It streams through `CsvReader`, so memory stays bounded. Checks:
+   - `struct VerifyOptions { std::vector<std::filesystem::path> files; std::optional<std::filesystem::path> epoch_log; };`, `struct VerifyResult { bool ok; std::vector<std::string> errors; };` and `VerifyResult verify_files(const VerifyOptions&);` in `blc_core`. Cap diagnostics (100 plus an omitted-count summary) while continuing to scan; memory is bounded by reader/parser capacity, file count and capped diagnostics. `tools/blc_verify.cpp` only parses arguments, prints diagnostics and sets exit status. `blc_verify [--epoch-log <stderr-log>] <file>...` detects type from headers and exits 0/1. Unit tests call the library; CI exercises the executable. Checks:
     - **All files:** exact header, column count on every row, full RFC 4180 parse, `tnsec`/`recv_tnsec` in [0, 999 999 999].
+     - **Numeric fields:** full-consumption decimal parsing, no whitespace/suffixes and explicit overflow checks: shard uint16, epoch uint32, conn_seq/seqNo uint64, apply_before_row checked against size_t; timestamps/book values int64, id int32. Unsigned fields reject signs. Receive-nanosecond reconstruction uses checked arithmetic. Prices/sizes are non-negative; non-padding price/size are both positive. Replay shares these row-validation helpers before constructing RecordHeader. Test negative shard/epoch, type maxima, overflow and trailing characters.
     - **Market data:** `venue` ∈ {spot, usdm}; `stream_kind` ∈ {depth_diff, depth5, trade}; `symbol` uppercase `[A-Z0-9]{2,20}` and constant per file; `payload_json` one line (no CR/LF) and valid JSON; `conn_seq` strictly increasing within each (shard, epoch); epochs non-decreasing.
     - **Order book:** `seqNo` contiguous from 0; `id` constant; `type` ∈ {R,D,P,T}; `side` ∈ {B,S,N}; the first row is `R`; non-zero bids strictly descending and asks strictly ascending; zero padding only after the last non-zero level, with price and size both 0.
     - **Sidecar:** `apply_before_row` non-decreasing and ≤ the paired market-data file's row count (when that file is given too).
     - **With `--epoch-log <stderr-log>`:** the frame-accounting invariant per (shard, epoch) against the `epoch_closed` lines.
+       Keep memory bounded by input-file count: merge each shard's per-symbol CSV cursors by (epoch, conn_seq), detecting duplicate sequence numbers across files and values outside the logged frame range. Scan the log forward for that shard's monotonically closed epochs (separate shard scans are acceptable); retain only current epoch counts, never a map/set for every row or epoch. Check initial/final missing sequence counts and internal gaps. Enforce constant shard per symbol; header-only files contribute no rows. Add cross-symbol duplicate and many-epoch tests.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -913,6 +970,8 @@ TEST(Consumer, ConcurrentProducerUnderTsan) { /* producer thread pushes 10^5 rec
 TEST(Replay, GlobSkipsOrderbookFiles) { /* inputs {market, orderbook} -> orderbook skipped (info), exit 0, one output */ }
 TEST(Replay, OnlyOrderbookFilesIsUsageError) { /* -> 2 */ }
 TEST(Replay, FailingFileDoesNotStopOthers) { /* bad header + good file -> good output written, exit 1 */ }
+TEST(Replay, MissingInputDoesNotStopOthers) { /* nonexistent path + good file -> good output, exit 1;
+  canonicalisation errors are per-file diagnostics, not an uncaught batch exception */ }
 TEST(Replay, MissingSidecarFails) { /* -> exit 1, message names the sidecar */ }
 TEST(Replay, NonMonotonicApplyBeforeRowRejected) { /* -> exit 1 */ }
 TEST(Replay, CrlfInputSameOutput) { /* converting a fixture to CRLF and dropping the final newline -> byte-identical output */ }
@@ -921,14 +980,19 @@ TEST(Replay, LossIntegrationReplaysIdentically) { /* tests/support/loss_scenario
   pipeline into dir (shared with LossIntegration, so neither test depends on the other's files); replaying dir -> byte-identical order book */ }
 TEST(Replay, SkipsByOrderbookHeader) { /* a file named market_data_x.csv whose header is the order-book header -> skipped with an info line */ }
 TEST(Replay, HeaderOnlyInput) { /* -> header-only output, exit 0 */ }
-TEST(Replay, ArchivedRunReplaysFromArchiveDir) { /* built at test time, not as a fixture (git ignores replaced_*/):
+TEST(Replay, ArchivedRunReplaysFromArchiveDir) { /* built at test time, not as a fixture (archive dirs are ignored by git):
   write run 1's three files, archive_existing them as a second run would, then replay
   replaced_<stamp>/market_data_*.csv -> equals run 1's order book */ }
-TEST(Verify, RejectsEachViolation) { /* blc_verify returns 1 for: wrong header, 25 columns, seqNo gap, type 'X', side 'Q',
-  bids not descending, payload with a newline, lower-case symbol, conn_seq not increasing; 0 for a valid fixture */ }
+TEST(Replay, DuplicateBasenamesRejectedBeforeOutputChanges) { /* same valid basename in two directories -> 2;
+  existing outputs untouched; repeated identical canonical input processed once */ }
+TEST(Verify, RejectsEachViolation) { /* verify_files().ok false for numeric ranges/overflow, wrong header,
+  column count, seqNo gap, type/side, ordering/padding, payload newline/invalid JSON, lower-case symbol,
+  non-increasing conn_seq and decreasing apply_before_row; true for valid fixtures */ }
+TEST(Verify, EpochLogAccounting) { /* valid counts -> ok; absent epoch, duplicate log line, unaccounted missing
+  sequence or count mismatch -> diagnostic naming shard/epoch */ }
 ```
 
-- [ ] **Step 2: Run** `--gtest_filter='Replay*'`. Expected: FAIL.
+- [ ] **Step 2: Run** `--gtest_filter='Replay*:Verify*'`. Expected: FAIL.
 - [ ] **Step 3: Implement.** Payloads are copied into a reusable padded buffer before parsing.
 - [ ] **Step 4: Run.** Expected: PASS. Also run `./build/debug/binance_capture --replay nothing.csv`: expect exit 1 and a message naming the file.
 - [ ] **Step 5: Commit** — `git commit -m "Add replay mode and blc_verify tool"`
@@ -967,7 +1031,8 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
     - build Release;
     - run scenario replays through the `market_data_*.csv` glob;
     - run `blc_verify` on all outputs;
-    - run `strace -f -e trace=socket -o strace.log ./build/binance_capture --replay ...`, then `! grep -q 'socket(' strace.log`;
+     - run `strace -f -e trace=socket -o strace.log ./build/binance_capture --replay ...`, then `if grep -q 'socket(' strace.log; then echo 'unexpected network call during replay' >&2; exit 1; fi`;
+     - regression-check that assertion in subprocesses: synthetic trace with `socket(` must fail, empty trace must pass; assert exit statuses explicitly;
     - run the secrets grep with the pattern assembled in the script from fragments. Every step uses `set -euo pipefail` and `grep -q`, never `grep -c`, whose exit status 1 on zero matches breaks `-e`.
     - run `scripts/verify_outputs.sh` on every replay output (exact headers, `awk -F',' 'NR==2{print NF}'` = 26, `blc_verify`);
     - check that the `-E` reading of the secrets pattern (assembled at runtime) matches nothing outside `docs/`, `README.md` and `.gitignore`, so the README's claim stays true.
@@ -1010,7 +1075,8 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
 - [ ] **Step 1: Write failing tests:**
   - `Backoff` with seed 1 and jitter 0: 500, 1000, 2000, … ms capped at 30 000; `reset()` restarts at 500. With jitter 0.2 every value lies within ±20 % of the un-jittered one;
   - spot target equals `/stream?streams=btcusdt@depth@100ms/btcusdt@depth5@100ms/btcusdt@trade`;
-  - usdm target prefix is `/public/stream?streams=`;
+   - full endpoints: spot WS `stream.binance.com:9443`, REST `api.binance.com:443`, depth `/api/v3/depth`, ticker `/api/v3/ticker/price`; usdm WS `fstream.binance.com:443`, REST `fapi.binance.com:443`, depth `/fapi/v1/depth`, ticker `/fapi/v1/ticker/price`;
+   - usdm target equals `/public/stream?streams=btcusdt@depth@100ms/btcusdt@depth5@100ms/btcusdt@trade`; REST targets carry `symbol=BTCUSDT` and depth `limit=1000`;
   - 120 symbols of 20 characters in one shard → `UsageError`;
   - `make_shards(256, 50)` gives 6 shards (the last one has 6 symbols);
   - the limiter allows 200 attempts in a window, denies the 201st, and allows again after the oldest expires.
@@ -1021,20 +1087,21 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
 
 **Files:**
 - Create: `src/blc/net/tls.hpp`, `src/blc/net/tls.cpp`, `src/blc/net/dispatch_policy.hpp`, `src/blc/net/dispatch_policy.cpp` (pure logic: no Asio, every call takes `now`), `src/blc/net/rest_scheduler.hpp`, `src/blc/net/rest_scheduler.cpp` (Asio glue: timers plus transport around the policy)
-- Test: `tests/net_dispatch_policy_test.cpp` (deterministic, explicit clock, no sleeping)
+- Test: `tests/net_dispatch_policy_test.cpp` (pure policy, explicit clock), `tests/net_rest_scheduler_test.cpp` (fake transport, manually driven io_context; no sleeping)
 
 **Interfaces:**
 - Produces:
   - `struct TlsConfig { std::string extra_ca_pem; };` — empty means the system store only.
   - `boost::asio::ssl::context make_tls_client_context(const TlsConfig&);` — TLS ≥ 1.2, `verify_peer`; on CA load failure it throws `IoError` mentioning `ca-certificates`.
-  - `class RestTransport` (interface): `virtual void get(const Endpoint&, std::string target, std::function<void(HttpResult)>) = 0;`, with `struct HttpResult { int status; std::string body; int retry_after_s; int used_weight_1m; std::int64_t recv_ns; bool transport_error; };` Implementation `BeastRestTransport`: Beast HTTP over TLS, SNI, host verification, 10 s timeout, body ≤ 1 MiB.
+   - `class RestTransport` (interface): virtual destructor; `virtual void get(const Endpoint&, std::string target, std::function<void(HttpResult)>) = 0;` and `virtual void cancel_all() noexcept = 0;`, with `struct HttpResult { int status; std::string body; int retry_after_s; int used_weight_1m; std::int64_t recv_ns, steady_ns; std::optional<std::int64_t> binance_error_code; bool transport_error; };` Implementation BeastRestTransport uses TLS, SNI, host verification, 10 s timeout and body ≤1 MiB. It reuses EnvelopeSplitter's JsonWorkspace (constructor reference, no parser per request): validate every 200 body before delivery; invalid JSON becomes a retryable transport failure and is never recorded. For 400, extract the root error code through the same workspace; policy uses that optional, without another parser. Capture both clocks at completed response receive; retain them while waiting for ring space. Cancellation stops resolvers/timers and closes lowest layers; callbacks complete at most once, without further operations after stop.
+   - `enum class RequestKind { Validation, Snapshot };` — retained by queued/in-flight requests and `Dispatch`, determining path, weight and 4xx interpretation. Validation finishes before snapshot requests can be queued.
   - `class DispatchPolicy` (pure):
     - `DispatchPolicy(Venue, const NetTuning&);`
-    - `void want(std::uint16_t symbol, std::uint64_t slot_value, Clock::time_point now);`
-    - `std::optional<Dispatch> next_dispatch(Clock::time_point now, std::int64_t wall_now_s);` — `Dispatch { std::uint16_t symbol; std::uint64_t slot_value; int weight; }`. `wall_now_s` places the usage header's minute boundary.
+     - `void want(RequestKind, std::uint16_t symbol, std::uint64_t slot_value, Clock::time_point now);` — validation carries no processor epoch; snapshots use Task 19's encoding.
+     - `std::optional<Dispatch> next_dispatch(Clock::time_point now, std::int64_t wall_now_s);` — `Dispatch { RequestKind kind; std::uint16_t symbol; std::uint64_t slot_value; int weight; }`. `wall_now_s` places the usage header's minute boundary.
     - `Clock::time_point next_wakeup(Clock::time_point now) const;`
-    - `Outcome on_response(std::uint16_t symbol, const HttpResult&, Clock::time_point now, std::int64_t wall_now_s);` — `Outcome` ∈ {`Deliver`, `Retry`, `Fatal`}.
-    - `enum class DeliveryResult { Delivered, Discard, RingFull };` and `struct ValidationResult { enum class Kind { Ok, InvalidSymbol, Unreachable } kind; std::string symbol; std::string message; };`
+     - `Outcome on_response(std::uint16_t symbol, const HttpResult&, Clock::time_point now, std::int64_t wall_now_s);` — `Outcome` ∈ {`Deliver`, `Retry`, `InvalidSymbol`, `Fatal`}. Validation 400 with Binance code -1121 is `InvalidSymbol` (exit 2); other non-retryable validation 4xx, and every non-retryable snapshot 4xx, are `Fatal` (exit 1). Request kind survives until completion.
+     - `enum class DeliveryResult { Delivered, Discard, RingFull };` and `struct ValidationResult { enum class Kind { Ok, InvalidSymbol, Unreachable, Fatal } kind; std::string symbol; std::string message; };`
     - `void on_delivery(std::uint16_t symbol, DeliveryResult, Clock::time_point now);`
     - `Clock` is `std::chrono::steady_clock`. Minute rollover for the usage header uses an injected `int64 wall_now_s` argument.
   - `class RestScheduler` (Asio glue around `DispatchPolicy`):
@@ -1042,7 +1109,8 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
     - `void validate_symbols(const std::vector<SymbolSpec>&, std::function<void(ValidationResult)>);`
     - `void want(std::uint16_t symbol, std::uint64_t slot_value);`
     - `void set_delivery(std::function<DeliveryResult(std::uint16_t symbol, std::uint32_t epoch, const HttpResult&)>);` — the delivery callback returns `Delivered`, `Discard` or `RingFull`.
-    - `void stop();`
+     - `void set_fatal(std::function<void(std::string_view)>);` — called once on the io thread for a fatal runtime response with a synchronously consumed diagnostic. Capture stores exit code 1 and begins shutdown.
+     - `void stop();` — idempotently sets stopping first, cancels timers, calls `transport.cancel_all()`, discards waiting bodies and releases slots. Completions check stopping before retry/delivery/fatal callbacks; cancelled work cannot restart.
   - Constants: budget 3 000 (spot) / 1 200 (usdm) per minute; weights 50/20 (depth) and 2/1 (ticker); 4 dispatch slots.
 
 - [ ] **Step 1: Write failing `DispatchPolicy` tests.** Each passes explicit `now` values; none sleeps.
@@ -1051,14 +1119,17 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
   - a 429 with `Retry-After: 5` pauses all dispatch for 5 s, and the request is requeued at the head;
   - a 418 with `Retry-After: 120` pauses all dispatch for 120 s; a 418 without the header pauses `default_retry_after`;
   - a 5xx is retried with backoff;
-  - a 400 is fatal;
+   - validation 400/-1121 -> InvalidSymbol; snapshot 400/-1121 and validation 403 -> Fatal; kinds use distinct weights/paths;
   - a newer slot value replaces a queued one in place;
   - a newer value during an in-flight request is served after it completes;
   - a failed request with a newer value waiting requeues only the newer one;
   - a `RingFull` delivery keeps the dispatch slot and retries in 10 ms;
+   - RingFull retries preserve the completed HttpResult's original wall/steady receive timestamps;
   - a `Discard` delivery releases the slot;
+   - four completed bodies waiting on RingFull retain all dispatch slots; a fifth request waits until one is delivered/discarded;
+   - scheduler stop during in-flight work and RingFull waiting cancels transport and releases slots; late callbacks cannot retry/deliver (fake transport test of scheduler glue, beside the pure-policy tests);
   - validation: 400 for `BTCUSDX` → result names the symbol; transport failure for 30 s → result is unreachable.
-- [ ] **Step 2: Run** `--gtest_filter='DispatchPolicy*'`. Expected: FAIL. **Step 3: Implement** the policy, then the scheduler glue: one steady timer, armed for `next_wakeup`. The glue's behaviour against a real transport is covered by Task 27. **Step 4: Run.** Expected: PASS.
+- [ ] **Step 2: Run** `--gtest_filter='DispatchPolicy*:RestScheduler*'`. Expected: FAIL. **Step 3: Implement** the policy, then the scheduler glue: one steady timer armed for `next_wakeup`. Fake-transport tests cover cancellation/completion guards; Task 27 covers real transport. **Step 4: Run.** Expected: PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Add TLS context, REST transport and weighted scheduler"`
 
 ### Task 25: `WsShard` — connection state machine, reconnect, state-aware shutdown
@@ -1071,12 +1142,13 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
 - Produces:
   - `class WsShard : public std::enable_shared_from_this<WsShard>`:
     - `enum class State { Waiting, Resolving, Connecting, TlsHandshake, WsHandshake, Open, Closing, Closed };`
-    - `WsShard(boost::asio::io_context&, boost::asio::ssl::context&, Endpoint, std::string target, FrameRouter&, AttemptLimiter&, const NetTuning&, IoMetrics&, int fault_reconnect_every_s);` — reconnect delays come from a `Backoff` built from `NetTuning`.
+     - `WsShard(boost::asio::io_context&, boost::asio::ssl::context&, Endpoint, std::string target, FrameRouter&, AttemptLimiter&, const NetTuning&, IoMetrics&);` — reconnect delays come from NetTuning. Task 30 adds the fault timer parameter/behavior after its failing test.
     - `void start();`
     - `void shutdown();` — per state, as in §6.7.
     - `State state() const;`
     - `std::uint32_t epoch() const;`
-  - Read buffer: `flat_buffer`, shrunk after messages > 256 KiB; `read_message_max(1 << 20)`; idle timeout 30 s with keep-alive pings.
+     - `void set_buffer_observer(std::function<void(std::size_t capacity, bool after_consume)>);` — optional library test observer, installed before start and called on io thread before consumption/after shrink; production leaves it unset.
+   - Read buffer: construct flat_buffer with explicit max capacity `1 << 20`, and set read_message_max to the same limit. After every completed read, consume all bytes and shrink_to_fit whenever capacity (not message length) exceeds 256 KiB; update the receive-capacity gauge after allocation/consumption. Idle timeout 30 s with keep-alive pings.
 
 - [ ] **Step 1: Implement.** Every handler checks `stopping_` first. Any read error, close or loss calls `FrameRouter::on_disconnected()` before anything else. Reconnects take a limiter token. A loss reported by `FrameRouter` closes the connection and reconnects at once, skipping backoff but not the limiter. Logic is tested by Task 27; there is no separate unit test here, because the class is I/O glue over pieces already tested.
 - [ ] **Step 2: Build** with `-Werror` in WSL (`cmake --preset release && cmake --build build/release`). Expected: no warnings.
@@ -1096,11 +1168,13 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
     - `TlsConfig tls;`
     - `NetTuning tuning;`
     - `std::function<std::unique_ptr<SymbolOutput>(const SymbolSpec&)> output_factory;` — empty means `FileOutput`. Tests use it to inject a failing writer.
+     - `std::function<void(std::uint16_t shard, std::size_t capacity, bool after_consume)> buffer_capacity_observer;` — optional; capture wires it through WsShard for the fragmented-buffer test.
     - Tests override everything except `options`' semantics.
-  - `int run_capture(const CaptureConfig&);` — exit codes per §2.
+   - `int run_capture(const CaptureConfig&, std::chrono::steady_clock::time_point started_at);` — required duration/uptime origin. Main records it before option parsing; every in-process test passes a fresh start or an intentionally earlier start for the elapsed-duration test. Never default it to the steady-clock epoch. Exit codes per §2.
   - `std::size_t budget_mib(std::size_t symbols, std::size_t connections);` — the §9 formula in bytes, rounded up to whole MiB:
     - ring band (16 / 32 / 64 MiB);
     - 5 MiB parser;
+     - 6 MiB process-wide io-thread JSON workspace (envelope validation/fallback and REST reuse);
     - 672 000 B decode scratch;
     - 64 KiB sidecar scratch;
     - 1 MiB minify scratch;
@@ -1119,7 +1193,7 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
     7. start shards.
 
     The `--duration` deadline is measured from process start (`main` records `steady_clock::now()` first), not from step 7.
-  - A `poll_interval` io timer scans `RequestSlots` and the consumer's `fatal_code`. Stats print every `stats_interval_s`.
+   - Arm duration/signals before validation; an already-expired duration starts no network work. Duration/signal during validation cancels it and exits 0 without files. Pass the same start, IoMetrics and stats interval into ConsumerConfig; the consumer owns periodic stats and the final processor summary. A poll timer scans RequestSlots and the consumer's atomic fatal_code. Wire RestScheduler's fatal callback to that fatal state and common shutdown; no runtime error can leave capture silently waiting for a snapshot.
   - The final summary prints `VmHWM`, `budget_mib`, the `epoch_closed` lines and a totals line. It checks `frames_received == md_rows + malformed_frames + ring_drops`; on a violation it logs an error, and the exit code becomes 1.
 
 - [ ] **Step 1: Write a failing test** `tests/net_budget_test.cpp`: `budget_mib(1, 1) == 84` (83.1 exactly), `budget_mib(256, 64) == 429` (428.6), and `budget_mib(256, 6) == 353` (the formula includes the io thread's 6 MiB envelope-splitter fallback).
@@ -1150,12 +1224,16 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
   - `ReversedEnvelopeFrames`: the server sends some frames with `data` before `stream` → the same rows as the forward form, and no loss transition.
   - `UntrustedCertificateRejected`: the client is given a different test CA → the TLS handshake fails, no rows are written, and the error is logged; verification is never bypassed (Q16).
   - `WriterFailureExitsOne`: `output_factory` returns a writer that fails after 5 rows → shutdown within `poll_interval` + `shutdown_deadline`, exit 1.
+   - `Snapshot400ExitsOne`: validation succeeds, depth responds 400/-1121 -> logged fatal response, cancelled work, exit 1.
+   - `DurationDuringValidation`: hold ticker past duration -> exit 0, no files/WebSockets. `AlreadyExpiredDuration`: earlier start's deadline already elapsed -> exit 0, zero REST/WS requests.
   - All timings come from a test `NetTuning` (limiter 5 attempts / 2 s, backoff 10–100 ms, shutdown deadline 1 s), multiplied by `BLC_TEST_TIME_SCALE`. Handshake-delay tests trigger SIGINT on a server event (ClientHello received / HTTP Upgrade received), not after a sleep. Assertions are orderings and upper bounds (for example "exit within 5 s × scale"), never exact counts.
   - `SigtermClean`: like `SigintClean`, with SIGTERM.
   - `DurationExpiryDuringHandshakes`: `--duration` expires while the server holds the TLS and then the WebSocket handshake → exit 0, no WebSocket close attempted.
   - `ShutdownWhileWaiting`: the server refuses connections, so the shard sits in backoff (`Waiting`); SIGINT → exit 0 promptly, no further attempts. (`Resolving`/`Connecting` complete instantly on loopback and cannot be held open reliably; their cancel path is the same `close lowest layer` call exercised by the handshake tests.)
   - `OversizedFrameRejected`: the server sends a 1.5 MiB frame → read error, reconnect, counted; no record pushed.
   - `OversizedRestBodyRetried`: a 1.5 MiB depth body → request fails, retried, counted; the symbol syncs once a normal body is served.
+   - `InvalidJsonDataIsLoss`: balanced envelope with invalid inner JSON -> no market row, loss/reconnect, resync on new epoch. `InvalidJsonSnapshotRetried`: invalid JSON 200 body -> counted/retried, no sidecar row, then sync on a valid response.
+   - `FragmentedBufferCapacityBounded`: scripted fragmented messages below 256 KiB and near 1 MiB; inspect an io-thread capacity observer before consumption and after shrink, assert transient ≤1 MiB and retained ≤256 KiB. Do not assume allocation capacity equals message length.
   - The test CA issues the server certificate with `subjectAltName = IP:127.0.0.1`, so `host_name_verification("127.0.0.1")` passes.
   - `DurationBeforeSyncExitsZero` (Review Focus 5): snapshots are delayed past `--duration 1` → exit 0; header-only order-book file; summary has `syncs=0`.
 - [ ] **Step 2: Run** in WSL: `./build/debug/tests/unit_tests --gtest_filter='CaptureLoopback*'`. Then run the same under `build/asan` and `build/tsan`. Expected: PASS, no sanitizer reports.
@@ -1171,7 +1249,10 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
   - (b) Release build, 60 s capture; `VmHWM ≤ budget_mib` from the summary;
   - `verify_outputs.sh` on both (headers, `awk -F',' 'NR==2{print NF}'` = 26, `blc_verify --epoch-log`);
   - replay of (b) → `cmp` with its order book;
-  - `depth5_mismatch=0` for venues on the `resync` policy.
+   - successful sync and output: syncs>0, ob_rows>0, non-zero best bid/ask in emitted BTCUSDT rows;
+   - active Resync policy: depth5_mismatch==0, spot depth5_verified>0 and depth5_full_levels_compared>0;
+     usdm depth5_partially_verified>0 and depth5_partial_levels_compared>0. On a documented CountOnly
+     fallback, require the respective full/partial attempt and comparison counters >0 and report its mismatch rate.
 
   Then, once on spot, a **multi-symbol** run: `--symbols BTCUSDT,ETHUSDT --symbols-per-connection 1` (two shards) for 60 s with the Release build, then `blc_verify`, replay of every `market_data_*.csv` and `cmp` per symbol. This is the X2 evidence, and it exercises shared sidecar scratch with interleaved snapshots.
 - [ ] **Step 2: Run** `scripts/live_smoke.sh` in WSL. Expected: prints `LIVE SMOKE PASSED` for spot and usdm. Also confirm whether GitHub runners get HTTP 451 (§15) with a one-off `workflow_dispatch` curl job, and record the result in design.md §15.
@@ -1188,27 +1269,26 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
 - [ ] **Step 2:** Add the `clang-tidy` job, run with `-warnings-as-errors='*'` (the repo's `.clang-tidy` keeps `WarningsAsErrors: ''` for local use), so any warning fails it. Push; expect green.
 - [ ] **Step 3:** Commit — `git commit -m "CI: clang-tidy job and fixes"`
 
-### Task 30: `--fault-reconnect-every`, limit validation, remaining shutdown tests
+### Task 30: `--fault-reconnect-every` runtime integration
 
-**Files:** Modify `src/blc/net/ws_shard.cpp`, `src/blc/cli/options.cpp`; Test: `tests/cli_options_test.cpp`, `tests/net_capture_loopback_test.cpp`
+**Files:** Modify `src/blc/net/ws_shard.{hpp,cpp}`, `src/blc/net/capture_app.cpp`; Test: `tests/net_capture_loopback_test.cpp`. Task 5 already covers parsing and negative options. This task adds the timer, capture wiring and runtime test.
 - [ ] **Step 1: Write failing tests:**
   - `FaultReconnectEvery`: with the loopback server and `--fault-reconnect-every 1`, the capture runs until at least epoch 2 has synced (event-gated, upper bound 10 s × scale). Assert epochs are strictly increasing, each epoch's first row is `R`, and no row precedes its epoch's `R`;
-  - option limits: `--fault-reconnect-every -1` and `--stats-interval -1` are usage errors.
 - [ ] **Step 2: Run.** FAIL. **Step 3: Implement.** **Step 4: Run.** PASS.
-- [ ] **Step 5: Commit** — `git commit -m "Add fault-injection reconnects and limit validation"`
+- [ ] **Step 5: Commit** — `git commit -m "Add fault-injection reconnect timer"`
 
 ### Task 31: Book and payload-parse benchmarks (mandatory: back Q11 and Q9)
 
 **Files:** Create `bench/CMakeLists.txt`, `bench/book_bench.cpp`, `bench/payload_bench.cpp`; root `CMakeLists.txt` adds `option(BLC_BUILD_BENCH OFF)`.
 - [ ] **Step 1: Implement** `blc_bench book` comparing `BookSide` with a `std::map` reference over four workloads (near-touch updates, deep updates, near-touch deletes, deep deletes; 10⁶ operations each; book of 1 000–5 000 levels). Print median ns/op and p99 over 10 repetitions.
-- [ ] **Step 1b: Implement** `blc_bench payload`: `PayloadParser` on the Task 9 fixtures (spot/usdm diff, depth5, trade), 10⁶ parses each. Print ns per message and MB/s.
+- [ ] **Step 1b: Implement** `blc_bench payload`: typed parsing on Task 9 fixtures and network syntax-validation/envelope split on their wrapped frames, 10⁶ iterations each. Print ns/message and MB/s separately, so the deliberate extra network validation pass is measured. Fixture lookup uses the configured benchmark source-directory constant.
 - [ ] **Step 2: Run** in WSL on Release. Paste the table and the machine description into README draft notes (`docs/benchmarks.md`).
 - [ ] **Step 3: Commit** — `git commit -m "Add book benchmark (flat vector vs std::map)"`
 
 ### Task 32: Long live runs
 
-- [ ] **Step 1:** In WSL (Release), run a 10-minute capture per venue and check `depth5_mismatch=0`, or apply the §5.6 `count-only` fallback with documented evidence.
-- [ ] **Step 2:** Run a 30-minute spot capture and record `coverage_exhausted`, `resyncs` and `VmHWM` against `budget_mib`.
+- [ ] **Step 1:** In WSL (Release), run a 10-minute capture per venue. Require syncs/ob_rows>0 and Task 28's positive venue-specific check/comparison evidence, plus depth5_mismatch==0 under Resync. Investigate any failure; CountOnly is allowed only with §5.6's documented evidence and non-zero comparisons, never as a substitute for missing checks.
+- [ ] **Step 2:** Run a 30-minute spot capture with the same sync/row/non-vacuity gates; record coverage_exhausted, resyncs and VmHWM against budget_mib.
 - [ ] **Step 3:** Record the results in design.md §15 and `docs/benchmarks.md`; update requirements.md. Commit — `git commit -m "Record long-run live verification"`
 
 ---
@@ -1226,7 +1306,8 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
   - a too-old snapshot is refetched;
   - an equal top counts `refresh_ok`; a different top swaps and counts `refresh_mismatch`;
   - exhaustion during the refresh hands the snapshot over to the resync;
-  - the property test with refresh on: no suppression from coverage exhaustion while snapshots arrive within 2 steps.
+   - with refresh on: emitted tops stay correct; exhaustion is allowed only when the independent coverage oracle requires it. For a separate no-exhaustion run, constrain depletion to ≤50 trusted levels per side per step, start refresh below 200 with ≥150 left, and deliver a usable snapshot within 2 steps (≤100 removed). Assert no coverage suppression under those generator bounds. Also inject one diff deleting all trusted levels: exhaustion/resync and suppression are required despite refresh.
+   - rerun the real-file allocation test with equal/different refresh swaps and exhaustion during refresh.
 - [ ] **Step 2: Run.** FAIL. **Step 3: Implement** §5.5. The shadow book is pre-reserved per symbol. **Step 4: Run.** PASS. **Step 5: Commit** — `git commit -m "Add background coverage refresh"`
 
 ### Task 34: Remaining benchmarks and performance notes
@@ -1247,7 +1328,7 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
 
 ### Task 36: README, `check_readme.sh`, `reviewer_checklist.sh`
 
-**Files:** Modify `README.md`; create `scripts/check_readme.sh`, `scripts/reviewer_checklist.sh`.
+**Files:** Modify `README.md`; create `.env.example`, `scripts/check_readme.sh`, `scripts/reviewer_checklist.sh`. The template contains only comments saying the program uses public endpoints and CLI options; no environment variables are read. It contains no settings or credential values.
 - [ ] **Step 1: Write the README.** Sections:
   - overview;
   - toolchain (GCC 12, C++17, Clang 15; dependencies with versions);
@@ -1264,12 +1345,14 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
   - benchmark table (Task 31);
   - **then, at the very end, the brief's section verbatim** with the adaptations listed in requirements.md S6.
 - [ ] **Step 2: Write `check_readme.sh`.** It extracts the README's text after the `How to Submit on GitHub` heading, then checks that every heading and command from S6 appears in order, allowing only the listed adaptations. Add it to CI.
+  Also require a tracked .env.example with comment/blank lines only, and retain S4's ignore/credential checks. Its existence/content must have evidence before marking S4 Done.
 - [ ] **Step 3: Write `reviewer_checklist.sh`.** It runs the brief's Reviewer Checklist verbatim in a scratch clone: clean build, a 300 s capture without `--output-dir` (the duration can be overridden for a quick run), the `awk` check (expect `26`), and the secrets grep (pattern assembled at runtime; expect empty).
 - [ ] **Step 4:** Run both in WSL. Expected: `README OK` and `CHECKLIST PASSED`. Commit — `git commit -m "Complete README and add reviewer checklist scripts"`
 
 ### Task 37: Release
 
-- [ ] **Step 1:** Walk requirements.md: every Functional, Submission and Review-focus row is **Done** with its evidence linked. Each stretch row is Done or Deferred with a reason.
+- [ ] **Step 1:** Walk requirements.md: every mandatory row except S5 (the tag being created here) is Done with linked evidence; stretch rows are Done or Deferred. S5 is checked after the tag exists, never marked Done in advance.
 - [ ] **Step 2:** In a fresh `ubuntu:22.04` container (`docker run` or a clean WSL distro), follow the README from `git clone` to the checklist. Expected: everything passes as written.
 - [ ] **Step 3:** `git tag -a v1.0.0 -m "Submission v1.0.0" && git push origin v1.0.0`. Confirm CI is green on the tag.
+- [ ] **Step 3b:** Verify the pushed annotated tag/target, record S5 evidence, then mark S5 Done in a documentation follow-up on main. Do not move or recreate the release tag. Recheck the completed gate before publication.
 - [ ] **Step 4:** **Ask the user for confirmation**, then make the repository public (`gh repo edit GruffElixir/binance-lob-capture --visibility public --accept-visibility-change-consequences`).
