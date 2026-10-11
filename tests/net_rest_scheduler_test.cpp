@@ -51,15 +51,25 @@ struct Rig {
     void validate_ok(const std::string& list) {
         symbols = parse_symbol_list(Venue::Spot, list);
         scheduler->validate_symbols(symbols, [this](ValidationResult r) { results.push_back(r); });
-        io.poll();
+        drive();
         for (std::size_t i = 0; i < symbols.size(); ++i) {
             HttpResult r;
             r.status = 200;
             r.body = R"({"symbol":"X","price":"1.0"})";
             transport.requests[i].done(r);
         }
-        io.poll();
+        drive();
         transport.requests.clear();
+    }
+
+    // An io_context that ran out of work stays stopped until restart().
+    void drive(std::chrono::milliseconds for_time = 0ms) {
+        io.restart();
+        if (for_time.count() > 0) {
+            io.run_for(for_time);
+        } else {
+            io.poll();
+        }
     }
 
     boost::asio::io_context io;
@@ -83,12 +93,12 @@ TEST(RestScheduler, ValidationOkThenSnapshotDelivered) {
         return DeliveryResult::Delivered;
     });
     rig.scheduler->want(1, (std::uint64_t{3} << 32) | 1);
-    rig.io.poll();
+    rig.drive();
     ASSERT_EQ(rig.transport.requests.size(), 1u);
     EXPECT_EQ(rig.transport.requests[0].endpoint.host, "api.binance.com");
     EXPECT_EQ(rig.transport.requests[0].target, "/api/v3/depth?symbol=ETHUSDT&limit=1000");
     rig.transport.requests[0].done(ok_body());
-    rig.io.poll();
+    rig.drive();
     ASSERT_EQ(delivered.size(), 1u);
     EXPECT_EQ(delivered[0].first, 1);
     EXPECT_EQ(delivered[0].second, 3u);
@@ -106,11 +116,11 @@ TEST(RestScheduler, RingFullRetryPreservesTimestamps) {
         return ++calls < 3 ? DeliveryResult::RingFull : DeliveryResult::Delivered;
     });
     rig.scheduler->want(0, 1);
-    rig.io.poll();
+    rig.drive();
     ASSERT_EQ(rig.transport.requests.size(), 1u);
     rig.transport.requests[0].done(ok_body(5555, 7777));
     for (int i = 0; i < 20 && calls < 3; ++i) {
-        rig.io.run_for(1ms);
+        rig.drive(1ms);
     }
     ASSERT_EQ(seen.size(), 3u);
     for (const auto& s : seen) {
@@ -125,14 +135,18 @@ TEST(RestScheduler, DiscardCounted) {
     rig.scheduler->set_delivery(
         [](std::uint16_t, std::uint32_t, const HttpResult&) { return DeliveryResult::Discard; });
     rig.scheduler->want(0, 1);
-    rig.io.poll();
+    rig.drive();
     rig.transport.requests[0].done(ok_body());
-    rig.io.poll();
+    rig.drive();
     EXPECT_EQ(rig.metrics.snapshots_discarded.load(), 1u);
 }
 
 TEST(RestScheduler, StopCancelsAndIgnoresLateCallbacks) {
     Rig rig;
+    rig.tuning.ring_retry = std::chrono::hours(1);  // the body is still waiting when we stop
+    rig.scheduler =
+        std::make_unique<RestScheduler>(rig.io, Venue::Spot, default_endpoints(Venue::Spot),
+                                        rig.tuning, rig.transport, rig.metrics);
     rig.validate_ok("BTCUSDT,ETHUSDT");
     int deliveries = 0;
     rig.scheduler->set_delivery([&](std::uint16_t, std::uint32_t, const HttpResult&) {
@@ -141,17 +155,17 @@ TEST(RestScheduler, StopCancelsAndIgnoresLateCallbacks) {
     });
     rig.scheduler->want(0, 1);
     rig.scheduler->want(1, 1);
-    rig.io.poll();
+    rig.drive();
     ASSERT_EQ(rig.transport.requests.size(), 2u);
     rig.transport.requests[0].done(ok_body());  // waits for ring space
-    rig.io.poll();
+    rig.drive();
     EXPECT_EQ(deliveries, 1);
     rig.scheduler->stop();
     rig.scheduler->stop();  // idempotent
     EXPECT_GE(rig.transport.cancels, 1);
     rig.transport.requests[1].done(ok_body());  // late completion after stop
     rig.scheduler->want(0, 2);
-    rig.io.run_for(20ms);
+    rig.drive(20ms);
     EXPECT_EQ(deliveries, 1);                      // no retry of the waiting body, no new delivery
     EXPECT_EQ(rig.transport.requests.size(), 2u);  // nothing dispatched after stop
 }
@@ -162,13 +176,13 @@ TEST(RestScheduler, FatalSnapshotResponseReported) {
     std::vector<std::string> fatal;
     rig.scheduler->set_fatal([&](std::string_view m) { fatal.emplace_back(m); });
     rig.scheduler->want(0, 1);
-    rig.io.poll();
+    rig.drive();
     HttpResult r;
     r.status = 400;
     r.body = R"({"code":-1121,"msg":"Invalid symbol."})";
     r.binance_error_code = -1121;
     rig.transport.requests[0].done(r);
-    rig.io.poll();
+    rig.drive();
     ASSERT_EQ(fatal.size(), 1u);
     EXPECT_NE(fatal[0].find("Invalid symbol"), std::string::npos) << fatal[0];
 }
@@ -178,7 +192,7 @@ TEST(RestScheduler, ValidationInvalidSymbolNamesIt) {
     rig.symbols = parse_symbol_list(Venue::Spot, "BTCUSDT,BTCUSDX");
     rig.scheduler->validate_symbols(rig.symbols,
                                     [&](ValidationResult r) { rig.results.push_back(r); });
-    rig.io.poll();
+    rig.drive();
     ASSERT_EQ(rig.transport.requests.size(), 2u);
     EXPECT_EQ(rig.transport.requests[1].target, "/api/v3/ticker/price?symbol=BTCUSDX");
     HttpResult ok;
@@ -190,7 +204,7 @@ TEST(RestScheduler, ValidationInvalidSymbolNamesIt) {
     bad.body = R"({"code":-1121,"msg":"Invalid symbol."})";
     bad.binance_error_code = -1121;
     rig.transport.requests[1].done(bad);
-    rig.io.poll();
+    rig.drive();
     ASSERT_EQ(rig.results.size(), 1u);
     EXPECT_EQ(rig.results[0].kind, ValidationResult::Kind::InvalidSymbol);
     EXPECT_EQ(rig.results[0].symbol, "BTCUSDX");
@@ -205,12 +219,12 @@ TEST(RestScheduler, ValidationUnreachable) {
     rig.symbols = parse_symbol_list(Venue::Spot, "BTCUSDT");
     rig.scheduler->validate_symbols(rig.symbols,
                                     [&](ValidationResult r) { rig.results.push_back(r); });
-    rig.io.poll();
+    rig.drive();
     ASSERT_EQ(rig.transport.requests.size(), 1u);
     HttpResult r;
     r.transport_error = true;
     rig.transport.requests[0].done(r);
-    rig.io.poll();
+    rig.drive();
     ASSERT_EQ(rig.results.size(), 1u);
     EXPECT_EQ(rig.results[0].kind, ValidationResult::Kind::Unreachable);
 }
