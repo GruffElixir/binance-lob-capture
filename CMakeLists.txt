@@ -44,6 +44,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
 include(Sanitizers)
 
+add_subdirectory(third_party/simdjson)
 add_subdirectory(src)
 
 if(BLC_BUILD_TESTS)

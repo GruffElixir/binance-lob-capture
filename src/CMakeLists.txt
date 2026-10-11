@@ -14,6 +14,7 @@ target_include_directories(blc_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_BINARY_DIR}/generated")
 target_compile_features(blc_core PUBLIC cxx_std_17)
+target_link_libraries(blc_core PUBLIC simdjson)
 blc_set_warnings(blc_core)
 
 add_executable(binance_capture main.cpp)

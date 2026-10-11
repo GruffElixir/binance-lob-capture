@@ -1,0 +1,5 @@
+simdjson 4.6.11 (https://github.com/simdjson/simdjson/tree/v4.6.11, singleheader/)
+SHA-256:
+a5c467c33c7871262eb4c82775490430758939c1c516fbdaeb662f8255860a60 *simdjson.h
+66c818d1a6b3841febef7a8336ff297f0a52e250a436b598bcdecf010d626243 *simdjson.cpp
+5fa8894e890bd77958f93b165433e0fb0dffa5bc982bfb147e4748e95bad24e5 *LICENSE

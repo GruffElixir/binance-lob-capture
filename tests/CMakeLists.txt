@@ -24,7 +24,8 @@ add_executable(unit_tests
     csv_writer_test.cpp
     csv_reader_test.cpp
     core_symbols_test.cpp
-    cli_options_test.cpp)
+    cli_options_test.cpp
+    simdjson_smoke_test.cpp)
 target_link_libraries(unit_tests PRIVATE blc_core GTest::gtest_main)
 target_include_directories(unit_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 blc_set_warnings(unit_tests)

@@ -1171,7 +1171,7 @@ src/
                            rest_scheduler.{hpp,cpp}, capture_app.{hpp,cpp}
     cli/                   options.{hpp,cpp}
     util/                  logging.{hpp,cpp}
-third_party/simdjson/      simdjson.h, simdjson.cpp, LICENSE, VERSION (pinned release)
+third_party/simdjson/      simdjson.h, simdjson.cpp, LICENSE, VERSION.txt (pinned release)
 tests/                     one test file per module; fixtures/ (real captured payloads);
                            scenarios/ (hand-built inputs with hand-derived expected outputs)
 bench/                     blc_bench (BLC_BUILD_BENCH=OFF by default)
@@ -1211,7 +1211,7 @@ passes a no-op implementation. The allocation test (§10) uses the real slots.
 |---|---|---|
 | Boost (Asio, Beast) | ≥ 1.74 (jammy) | `libboost-all-dev`; header-only use |
 | OpenSSL | ≥ 1.1.1 (jammy: 3.0) | `libssl-dev` |
-| simdjson | 4.6.11, recorded in `third_party/simdjson/VERSION` (latest of the mature 4.x line; 5.0 shipped 2026-09-28 and is still taking patch releases) | Vendored single-header amalgamation |
+| simdjson | 4.6.11, recorded in `third_party/simdjson/VERSION.txt` (latest of the mature 4.x line; 5.0 shipped 2026-09-28 and is still taking patch releases) | Vendored single-header amalgamation |
 | GoogleTest | 1.17.0 | CMake `FetchContent`, URL + SHA-256 pinned, tests only |
 | zlib | jammy | Listed in the brief's package list; not linked (Binance does not negotiate `permessage-deflate`) |
 
