@@ -3,6 +3,7 @@ configure_file(blc/version.hpp.in "${CMAKE_BINARY_DIR}/generated/blc/version.hpp
 # All capture / book / CSV logic lives in blc_core so the CLI and the unit tests share one
 # implementation. Networking (Boost.Beast, OpenSSL) lives in blc_net.
 add_library(blc_core STATIC
+    blc/core/decimal.cpp
     blc/core/time.cpp)
 target_include_directories(blc_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
