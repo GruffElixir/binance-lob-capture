@@ -218,9 +218,9 @@ TEST(RestScheduler, ValidationUnreachable) {
 TEST(Tls, ClientContext) {
     EXPECT_NO_THROW(make_tls_client_context(TlsConfig{}));
     TlsConfig bad;
-    bad.extra_ca_pem = "-----BEGIN CERTIFICATE-----
-        not a certificate-- -- -END CERTIFICATE-- -- -";
-        EXPECT_THROW(make_tls_client_context(bad), IoError);
+    bad.extra_ca_pem =
+        "-----BEGIN CERTIFICATE-----\nnot a certificate\n-----END CERTIFICATE-----\n";
+    EXPECT_THROW(make_tls_client_context(bad), IoError);
 }
 
 }  // namespace
