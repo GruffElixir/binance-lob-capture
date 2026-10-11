@@ -43,7 +43,7 @@ binance_capture --help | --version
 | `--output-dir` | both | capture: `.`; replay: `./replay_output` | Created if missing |
 | `--duration` | capture | `0` = run until SIGINT/SIGTERM | Integer seconds, 0–2 678 400 (31 days), counted from process start |
 | `--no-trade-rows` | both | off | Trades still go to the market-data CSV but produce no order-book rows (§5.8) |
-| `--symbols-per-connection` | capture | `50` | 1 – venue cap (§9); the resulting stream URL must also fit the 8 192-byte limit |
+| `--symbols-per-connection` | capture | `50` | 1 – venue cap (§9); the resulting stream URL must also fit the 8 192-byte limit, and the process may open at most 64 connections (§9) |
 | `--stats-interval` | both | `10` | Seconds between stats lines on stderr; `0` = final summary only |
 | `--fault-reconnect-every` | capture | `0` = off | Testing aid (built in M6): force-close every connection each N seconds to exercise reconnect + resync live |
 | `--replay` | replay | — | One or more market-data CSVs, e.g. `output/market_data_*.csv`. Order-book files matched by that glob are skipped; each remaining file is replayed independently (§7) |
@@ -637,7 +637,8 @@ consumer is idle.
   - every further frame of the current connection is discarded without being pushed (each
     consumes its `conn_seq` and is counted in `ring_drops` as withheld), so no record received
     after the loss reaches the processor;
-  - the connection is closed and reconnected at once (the first attempt skips the backoff);
+  - the connection is closed and reconnected at once: the first attempt skips the shard's
+    backoff, but still takes a token from the process-wide attempt limiter (below);
   - snapshot responses for the shard's symbols are discarded, not delivered (§6.3);
   - the next connection's records carry a new `conn_epoch`, so each symbol resets at its first
     record after the loss (§5.7) and resynchronises.
@@ -656,8 +657,18 @@ consumer is idle.
   malformed. A reversed-envelope fixture covers this path.
 - **Reconnect:** any read error, close or timeout schedules a reconnect with backoff (500 ms,
   doubling, capped at 30 s, ±20 % jitter, reset after 60 s connected). This also covers
-  Binance's 24-hour disconnect. A successful handshake increments `conn_epoch`. Attempt rates
-  stay far below spot's 300 connections per 5 minutes per IP.
+  Binance's 24-hour disconnect. A successful handshake increments `conn_epoch`.
+- **Process-wide connection-attempt limit.** Binance spot allows 300 connection attempts per
+  5 minutes per IP; USD-M documents no figure, so the same limit is applied to both venues.
+  Per-shard backoff cannot enforce an IP-wide limit, so every attempt takes a token from one
+  shared limiter: a sliding window of 200 attempts per 5 minutes (two thirds of the limit). This
+  covers startup connections, ordinary reconnects, `--fault-reconnect-every` reconnects and
+  loss recovery.
+  - An attempt with no token available waits for one; the waits are counted as
+    `connect_throttled`.
+  - Loss recovery skips only its own shard's backoff, never the limiter.
+  - To leave room for reconnects, a process may open at most 64 connections (§9). Startup
+    therefore uses at most 64 of the 200 attempts.
 - **`--fault-reconnect-every N`:** a timer force-closes each connection every N seconds.
 
 ### 6.3 REST snapshot scheduler
@@ -671,8 +682,11 @@ budget. Limits verified live on 2026-10-11 via `exchangeInfo` and `X-MBX-USED-WE
 | usdm | 2 400 / min | 1 200 / min | 20 |
 
 - **Pacing:** a token bucket with capacity = budget, refilled at budget / 60 per second. A
-  request is dispatched only when the bucket holds its weight and fewer than 4 requests are in
-  flight. Requests are served FIFO.
+  request is dispatched only when the bucket holds its weight and fewer than 4 of the 4
+  **request slots** are taken. Requests are served FIFO. A slot is taken at dispatch and released
+  only when its response has been pushed to the ring or discarded, not when the HTTP exchange
+  completes. A completed body waiting for ring space therefore keeps its slot, so at most 4
+  bodies exist at any time (in flight or waiting), and no new request starts while 4 wait.
 - **One slot per symbol, holding the latest wanted request.** The slot holds the newest
   `(epoch, request number)` seen from the processor.
   - A newer value replaces a queued request in place, keeping its queue position.
@@ -834,7 +848,18 @@ Steps:
    - set `stopping`;
    - cancel timers;
    - the scheduler stops dispatching and cancels in-flight requests;
-   - every shard starts `async_close` with a 2 s timeout, and no reconnect is scheduled;
+   - every shard shuts down according to its connection state (`Resolving`, `Connecting`,
+     `TlsHandshake`, `WsHandshake`, `Open`, `Closing`, `Closed`):
+     - **`Open`:** graceful `async_close`, with a 2 s timeout after which the TCP socket is
+       closed;
+     - **any earlier state:** the pending resolve, connect or handshake is cancelled by
+       cancelling the resolver or closing the lowest-layer TCP socket. No WebSocket operation is
+       started while a handshake is pending: Beast 1.74 forbids other stream operations until a
+       handshake completes;
+     - **`Closing` / `Closed`:** nothing to do;
+   - every completion handler checks `stopping` first. After shutdown has begun, a handler that
+     completes (including with `operation_aborted`) never advances the state machine: no
+     handshake step, read, reconnect or record push is started;
    - a 3 s deadline timer calls `io_context::stop()` if anything hangs.
 
    A read that completes after `stopping` was set may still push its record: that data was
@@ -917,7 +942,7 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
   - `frames_received` and bytes per stream kind, `malformed_frames` (invalid envelope or
     unsubscribed stream), `ring_drops` (dropped on a full ring or withheld after a loss),
     `shard_losses`, `snapshots_discarded`;
-  - `connects`, `reconnects`, `connect_failures`;
+  - `connects`, `reconnects`, `connect_failures`, `connect_throttled`;
   - `rest_requests`, `rest_failures`, `rest_cooldowns`, `rest_weight_used`.
 - **Processor counters:**
   - rows: `md_rows`, `ob_rows`, `snapshot_rows`;
@@ -953,6 +978,8 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 |---|---|---|
 | Symbols per process | 256 | Usage error |
 | Streams per connection | 1 024 on both venues (341 symbols) — §15 | Usage error |
+| Connections per process | 64, i.e. `⌈symbols ÷ --symbols-per-connection⌉ ≤ 64` | Usage error |
+| Connection attempts | 200 per sliding 5 minutes, process-wide (§6.2) | Attempt waits, counted |
 | Stream URL length | 8 192 bytes (often the binding limit: ≈ 94 bytes per 20-character symbol) | Usage error |
 | WebSocket message | 1 MiB | Frame rejected (Beast error) → reconnect, counted |
 | REST body | 1 MiB (a `limit=1000` snapshot is ≈ 64 KB spot, ≈ 42 KB usdm) | Request failed → retry, counted |
@@ -988,12 +1015,12 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 |---|---|---|
 | WebSocket receive buffer, per connection (§6.2) | ≤ 256 KiB | ≤ 1 MiB while reading a message larger than 256 KiB |
 | TLS + WebSocket stream state, per connection (OpenSSL record buffers ≈ 2 × 17 KiB plus Beast state; an estimate, measured in M5) | ≈ 64 KiB | — |
-| REST session, at most 4 concurrent (§6.3) | 0 after completion | ≈ 1 MiB body + ≈ 64 KiB TLS each |
+| REST request slot, at most 4 (§6.3): in flight, or a completed body waiting for ring space | 0 once delivered or discarded | ≤ 1 MiB body + ≈ 64 KiB TLS each; ≤ 4.3 MiB in total, including bodies waiting on a full ring |
 
 - **Default, up to 50 symbols** (1 connection): ≈ 0.3 MiB retained, ≤ 5.3 MiB transient.
-- **Worst case, 256 connections** (`--symbols-per-connection 1`): ≈ 80 MiB retained. Up to
-  256 MiB more is transient, and only if every connection were reading a maximum-size message
-  at the same moment.
+- **Worst case, 64 connections** (the process cap, §9): ≈ 20 MiB retained. Up to 64 MiB more
+  is transient, and only if every connection were reading a maximum-size message at the same
+  moment.
 
 **RSS acceptance.**
 
@@ -1004,10 +1031,15 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
   - a 48 MiB allowance for code, shared libraries, allocator overhead and OpenSSL globals.
 - `budget_mib` is logged at startup and printed in the final summary next to peak RSS
   (`VmHWM`).
-- **Acceptance:** `VmHWM ≤ budget_mib`. `live_smoke.sh` (M5) and the long runs in M6 fail
-  otherwise.
+- **Acceptance:** `VmHWM ≤ budget_mib`, checked only on **Release** builds:
+  - the Release capture in `live_smoke.sh` (M5);
+  - the long runs in M6.
+
+  A run fails otherwise. Sanitizer builds (ASan/LSan, TSan) are judged on lifecycle checks
+  (no leaks, races or errors) and never against this budget, because their runtime memory
+  (quarantine, redzones, shadow) is outside the native accounting.
 - **Example budgets:** ≈ 23 + 0.3 + 5.4 + 48 ≈ 77 MiB for one symbol;
-  ≈ 286 + 80 + 260 + 48 ≈ 674 MiB for 256 symbols on 256 connections.
+  ≈ 286 + 20 + 68 + 48 ≈ 422 MiB for 256 symbols on 64 connections.
 - The operating system commits pages only when they are touched, so a quiet symbol's resident
   memory stays below its reservation.
 - The `retained_bytes` gauge reports processor and ring storage plus the receive buffers'
@@ -1201,9 +1233,9 @@ results derived independently of the code under test.
 | **Exchange simulator** (property test) | A reference "exchange" holds a full-depth book and generates random activity: diffs, depth5, trades, REST snapshots truncated to 1 000 levels, reconnects. The output is fed through the processor. Every emitted row must equal the simulator's true top 5 at that point, and output may be suppressed only when the rules require it. 10⁵+ steps across seeds, both venues |
 | **Scenario fixtures** | Small hand-written market-data + sidecar files with hand-derived expected order-book CSVs: initial sync with overlap, spot/usdm bridge boundaries, gap → resync, two symbols on one shard across a reconnect (each replayed alone), coverage exhaustion, depth5 mismatch → resync, depth5 extending beyond coverage (no false mismatch), oversized diff, sync completed by a later diff, reversed envelope, trade side mapping, and two successive same-day runs with the first run's archived set replayed from its `replaced_<…>/` directory |
 | **Consistency** | Golden-file replay of captured fixtures; live → replay `cmp` on `samples/` |
-| **`capture_loopback` integration** (CI, under ASan+LSan and TSan) | Exercises the real `WsShard`, `RestScheduler` and TLS stack against an in-process server on 127.0.0.1: a Beast TLS WebSocket server plus HTTPS `depth` and `ticker/price` endpoints (the latter answering valid and invalid symbols, so startup validation runs for real). A test CA and server certificate are generated in memory at test start (no key material is committed) and injected into the client's `ssl::context`, so peer and hostname verification stay on. Endpoints and CA reach the client through the library-level capture configuration, not the CLI. Covers connect, frames, snapshot sync, 429 cooldown, server-forced reconnect, a loss transition, SIGINT via `raise`, a second SIGINT, and `--duration` expiry. Asserts correct outputs, a clean exit, and no leak or race reports |
+| **`capture_loopback` integration** (CI, under ASan+LSan and TSan) | Exercises the real `WsShard`, `RestScheduler` and TLS stack against an in-process server on 127.0.0.1: a Beast TLS WebSocket server plus HTTPS `depth` and `ticker/price` endpoints (the latter answering valid and invalid symbols, so startup validation runs for real). A test CA and server certificate are generated in memory at test start (no key material is committed) and injected into the client's `ssl::context`, so peer and hostname verification stay on. Endpoints and CA reach the client through the library-level capture configuration, not the CLI. Covers connect, frames, snapshot sync, 429 cooldown, server-forced reconnect, a loss transition, SIGINT via `raise`, a second SIGINT, and `--duration` expiry. It also covers shutdown in every connection state: the server deliberately delays its TLS and WebSocket handshakes, and SIGINT and `--duration` expiry arrive during each delay. That shutdown must cancel the transport, start no WebSocket operation and never advance the state machine. Finally, it covers the attempt limiter: with a small test window, reconnect storms wait for tokens rather than exceed the limit. Asserts correct outputs, a clean exit, and no leak or race reports |
 | `replay` CLI | Replay through the `market_data_*.csv` glob skips order-book files; one failing file does not stop the others; exit codes 0/1/2 |
-| `live_smoke.sh` (local) | 60 s live capture per venue with an ASan build, ended by SIGINT (zero LSan reports); `verify_outputs.sh`; replay → `cmp`; `depth5_mismatch=0` for each venue on the `resync` policy (a venue on `count-only`, §5.6, only reports its rate); peak RSS within budget |
+| `live_smoke.sh` (local) | 60 s live capture per venue with an ASan build, ended by SIGINT (zero LSan reports); `verify_outputs.sh`; replay → `cmp`; `depth5_mismatch=0` for each venue on the `resync` policy (a venue on `count-only`, §5.6, only reports its rate). A second 60 s capture per venue with the **Release** build checks peak RSS against `budget_mib`. The ASan run has no RSS gate, because ASan's quarantine, redzones and shadow memory lie outside the native accounting |
 | `rest_scheduler` | Token bucket and FIFO order; header reconciliation; global 429/418 cooldown; slot replacement when a newer `(epoch, request number)` arrives while a request is queued, and again while one is in flight (the newer one is served after it completes); the first request on epoch 0 is noticed (0 = no request); a failed request with a newer value waiting requeues only the newer one; 5xx retried; non-current responses discarded; other 4xx fatal |
 
 TDD applies: each module's tests are written before its implementation.
@@ -1279,7 +1311,7 @@ requirement row it delivers moved to **Done** in [requirements.md](requirements.
 | M3 | Order book: `book_side`, coverage, sequence classifier, recent-diff window, sync state machine, depth5 check, exchange simulator | M2 | Simulator property test and sync, coverage and depth5 suites green |
 | M4 | Pipeline + replay: SPSC ring first, alone (TSan job); then `FrameRouter` with the loss transition, processor, output files with archive rule, sidecar, replay mode, `blc_verify`, scenario fixtures, `loss` integration test, allocation test. CI: output contract (scenario part), Valgrind | M3 | Every scenario fixture replays to its hand-derived expected output; `loss` integration test green; zero allocations |
 | M5 | Networking (needs WSL): endpoints, TLS, `WsShard`, REST scheduler with startup symbol validation, capture app, signals and `--duration`, shutdown protocol, metrics and stats, `capture_loopback` integration test (CI under ASan and TSan) | M4 | Loopback test green under both sanitizers; `live_smoke.sh` (ASan build) passes for both venues; frame-accounting invariant holds |
-| M6 | Hardening: clang-tidy job, `--fault-reconnect-every`, shutdown tests, limit validation, book benchmark (flat vector vs `std::map`, backs Q11), 10-minute depth5 and 30-minute coverage runs, RSS acceptance on long runs | M5 | All CI jobs green; `depth5_mismatch=0` live, or, if a venue had to fall back to `count-only` (§5.6), its measured rate documented with evidence; `VmHWM ≤ budget_mib`; book benchmark numbers in README |
+| M6 | Hardening: clang-tidy job, `--fault-reconnect-every`, shutdown tests, limit validation, book benchmark (flat vector vs `std::map`, backs Q11), 10-minute depth5 and 30-minute coverage runs, RSS acceptance on long Release runs | M5 | All CI jobs green; `depth5_mismatch=0` live, or, if a venue had to fall back to `count-only` (§5.6), its measured rate documented with evidence; `VmHWM ≤ budget_mib`; book benchmark numbers in README |
 | M7 *(optional)* | Enhancement and performance: background coverage refresh (§5.5), remaining benchmarks and performance notes (X3) | M6 | Refresh suite green; live 30-minute run recorded; benchmark numbers in README |
 | M8 | Submission: 1–2 minute sample captures, live = replay `cmp`, full README (including the brief's submission section), `reviewer_checklist.sh`, tag `v1.0.0`, repository made public with the user's confirmation | M6 (and M7 only if completed) | Every mandatory row in requirements.md is Done |
 
