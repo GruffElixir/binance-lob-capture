@@ -15,7 +15,7 @@ if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
 endif()
 
 project(binance_lob_capture
-    VERSION 0.1.0
+    VERSION 1.0.0
     DESCRIPTION "Binance WebSocket market-data capture (CSV) + local order book (CSV)"
     LANGUAGES CXX)
 
