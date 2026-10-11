@@ -7,13 +7,14 @@ recorded in [benchmarks.md](benchmarks.md).
 
 ## Completed local checks
 
-- Ubuntu 22.04, GCC 12, Boost 1.74, OpenSSL 3.0.2: Debug suite **297/297 passed**, including
+- Ubuntu 22.04, GCC 12, Boost 1.74, OpenSSL 3.0.2: Debug suite **302/302 passed**, including
   POSIX permission and `/dev/full` failures. Release build passed with warnings as errors.
-- Windows, MinGW GCC 16: **295 passed**, two Linux-only tests skipped as expected.
-- The 28 real TLS loopback cases exercise signals, connection-state cancellation, second
+- Windows, MinGW GCC 16: **299 passed**, three tests skipped: symlink creation requires extra
+  Windows privileges; directory permission and `/dev/full` cases require Linux.
+- The 29 real TLS loopback cases exercise signals, connection-state cancellation, second
   signal, bounded fragmented messages, reconnect, fault timers, invalid JSON, rate cooldown,
-  writer failure, certificate rejection and duration expiry. The final REST guard check
-  passed all 35 REST/loopback tests.
+  writer failure, certificate rejection, duration expiry and previous-run archive reporting.
+  Separate REST transport tests cover pending DNS deadlines, cancellation and late callbacks.
 - Coverage refresh: seven tests failed before implementation and passed afterwards. Both
   venues have an independent full-depth property oracle; finite-coverage exhaustion remains
   tested separately. Real-file allocation tests cover equal/different refresh swaps and
@@ -24,9 +25,18 @@ recorded in [benchmarks.md](benchmarks.md).
   rows**, one snapshot row, **1,185 full depth5 checks**, zero mismatches/drops/parse errors,
   and **30,684 KiB peak RSS** against an 84 MiB budget. All three CSVs verified, with exact
   replay equality.
-- Earlier full sanitizer suites passed: ASan/UBSan/LSan **287 tests**, TSan **288 tests**.
-  The final suites include subsequent refresh and hardening changes and are checked before
-  release.
+- Final full sanitizer suites: ASan/UBSan/LSan **302/302 passed**, TSan **302/302 passed**.
+  The committed sample also verified and replayed identically under ASan/UBSan/LSan.
+- A clean official Ubuntu 22.04 filesystem, bootstrapped independently inside WSL, used only
+  the README packages plus Git. The README Release build and all **302 tests** passed as a
+  regular user. The checklist then cloned the final tree again, ran the exact default build,
+  completed a real **300-second** BTCUSDT capture without `--output-dir`, checked 26 columns,
+  the literal grep, frame accounting and positive live gates, and printed **CHECKLIST PASSED**.
+- [CI run 38164859492](https://github.com/GruffElixir/binance-lob-capture/actions/runs/38164859492)
+  passed every mandatory job on `2f2bece`: GCC 12 and Clang 15 warning-free Release builds,
+  formatting, clang-tidy, ASan/UBSan, TSan, Valgrind, clean default build, scenarios, schemas,
+  sample equality and the no-socket replay assertion. The optional availability probe was
+  separately verified in the run linked from [benchmarks.md](benchmarks.md).
 
 ## Reproduction
 
@@ -59,6 +69,25 @@ no sockets. Live public endpoint availability is probed separately from determin
   and explain the reserved storage or simdjson rvalue API requirement.
 - Public repository visibility was explicitly authorized by the user on 2026-10-11 and
   applied immediately. The annotated submission tag remains a final release step.
+- Docker was unavailable, so release validation used a fresh official Jammy filesystem with
+  independent packages and checkout in a chroot under WSL. The host kernel is shared, as it
+  would be for a container; existing development headers/build caches were not exposed.
+- A local TSan object compiled before the newest archive test initially yielded 301 tests.
+  Test-list comparison exposed the omission; forced recompilation and the complete 302-test
+  run passed. Fresh CI independently compiled every test from its checkout.
+
+## Plan completion
+
+| Tasks | Result | Implementation/evidence |
+|---|---|---|
+| 1–24 | Complete before continuation | `5fe6bb0`; primitives, parsing, book, bounded pipeline, replay, scheduler and transport |
+| 25–28, 30 | Complete | `3be903b`, `2f2bece`; live capture, TLS loopback, shutdown, live smoke and fault reconnect |
+| 29 | Complete | `ef3b91e`, `2f2bece`; clang-tidy, warning-free compilers and CI |
+| 31, 34 | Complete | `ef3b91e`; [reproducible benchmark results](benchmarks.md) |
+| 32 | Complete | `2f2bece`; both-venue 10-minute and 30-minute Spot [live results](benchmarks.md) |
+| 33 | Complete | `b29ad26`; coverage refresh, independent property oracle and allocation tests |
+| 35–36 | Complete | `5f8a312`, `2f2bece`; real sample, README, exact command manifest and clean checklist |
+| 37 | Release integration remains | Public visibility done; annotated `v1.0.0` and final S5 bookkeeping follow integration |
 
 ## Final independent review
 
