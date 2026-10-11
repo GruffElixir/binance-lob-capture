@@ -1001,7 +1001,7 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 |---|---|---|
 | Ring (§6.4) | 16 / 32 / 64 MiB by symbol count | Fixed |
 | simdjson parser (capacity 1 MiB, ≈ 5× capacity) | ≈ 5 MiB | Fixed |
-| Decode scratch (20 000 diff levels + 2 000 snapshot levels, 16 B each) | ≈ 344 KiB | Fixed |
+| Decode scratch (a diff's bids and asks each reserved to 20 000 levels, since one side may hold them all, + 2 × 1 000 snapshot levels; 16 B each) | ≈ 656 KiB | Fixed |
 | Sidecar escape scratch | 64 KiB | Fixed |
 | Request slots (one 8-byte atomic per symbol) | ≤ 2 KiB | Fixed |
 | Minify scratch (one payload, ≤ 1 MiB, §3.3) | 1 MiB | Fixed |
@@ -1010,9 +1010,9 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 | Recent-diff window (20 000 levels × 16 B + 2 000 headers × 40 B) | ≈ 391 KiB | Per symbol |
 | Pending snapshot (2 × 1 000 levels × 16 B) | ≈ 31 KiB | Per symbol |
 
-- **Per symbol:** ≈ 0.85 MiB.
-- **One symbol:** ≈ 16 + 5 + 1.4 + 0.85 ≈ 23 MiB (fixed scratch: decode, sidecar, minify, slots ≈ 1.4 MiB).
-- **256 symbols:** ≈ 64 + 5 + 1.4 + 216 ≈ 286 MiB.
+- **Per symbol:** 883 136 B ≈ 0.84 MiB.
+- **One symbol:** ≈ 16 + 5 + 1.7 + 0.84 ≈ 23.5 MiB (fixed scratch: decode, sidecar, minify, slots ≈ 1.7 MiB).
+- **256 symbols:** ≈ 64 + 5 + 1.7 + 215.6 ≈ 286.3 MiB.
 
 **Network storage** (io thread). Connections = ⌈symbols ÷ `--symbols-per-connection`⌉.
 
@@ -1043,8 +1043,9 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
   A run fails otherwise. Sanitizer builds (ASan/LSan, TSan) are judged on lifecycle checks
   (no leaks, races or errors) and never against this budget, because their runtime memory
   (quarantine, redzones, shadow) is outside the native accounting.
-- **Example budgets:** ≈ 23 + 0.3 + 5.4 + 48 ≈ 77 MiB for one symbol;
-  ≈ 286 + 20 + 68 + 48 ≈ 422 MiB for 256 symbols on 64 connections.
+- **Example budgets:** the sum is computed in bytes and rounded up to whole MiB: 78 MiB for
+  one symbol on one connection (77.1 exactly), 423 MiB for 256 symbols on 64 connections
+  (422.6).
 - The operating system commits pages only when they are touched, so a quiet symbol's resident
   memory stays below its reservation.
 - The `retained_bytes` gauge reports processor and ring storage plus the receive buffers'
@@ -1066,8 +1067,8 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
     its own source.
   - The README explains both readings of the command. As written (basic regex, `|` literal) it
     prints nothing. Read as alternation (`-E`), it matches only the `config/secrets.json` line the
-    brief requires in `.gitignore`, plus documentation that discusses this check (the README,
-    design.md and requirements.md). It never matches source code or data.
+    brief requires in `.gitignore`, plus documentation that discusses this check (the README and
+    files under `docs/`). It never matches source code or data.
 - **`.env.example`** exists only because the brief asks for one: it contains comments stating
   that no environment variables or credentials are used, and all settings are command-line
   flags.
@@ -1075,8 +1076,9 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 ## 10. Performance and allocation strategy
 
 - **JSON:** simdjson On-Demand. Each payload is parsed exactly once, on the processor; envelope
-  splitting is a bounded byte scan (§6.2). Levels are read with `get_raw_json_string()` (prices
-  contain no escapes) straight into the decimal parser.
+  splitting is a bounded byte scan (§6.2). Level strings are read with `get_string()`, which
+  un-escapes into the parser's own pre-allocated string buffer (no allocation; a raw JSON string
+  has no length), straight into the decimal parser.
 - **Zero heap allocations per record — scope of the claim:**
   - **Covered:** everything the processor does for a record, for every record kind and in every
     state, starting with the first record after startup:
