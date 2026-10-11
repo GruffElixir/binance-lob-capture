@@ -100,7 +100,10 @@ void FileOutput::book_row(std::int64_t recv_ns, std::uint64_t seq, std::int32_t 
 // --- BookOnlyOutput -----------------------------------------------------------------------------
 
 BookOnlyOutput::BookOnlyOutput(const std::filesystem::path& orderbook_path)
-    : buffer_(std::make_unique<char[]>(SymbolFiles::kBufferBytes)),
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays): preallocated writer buffer
+    : buffer_(std::make_unique<char[]>(
+          SymbolFiles::kBufferBytes)),  // NOLINT(modernize-avoid-c-arrays): dynamically sized
+                                        // preallocated backing storage
       file_(OutputFile::create(orderbook_path, buffer_.get(), SymbolFiles::kBufferBytes)) {
     file_.write(kOrderBookHeader);
     file_.write_char('\n');
@@ -167,7 +170,10 @@ Processor::Processor(ProcessorConfig config, std::vector<std::unique_ptr<SymbolO
       requester_(requester),
       diff_(PayloadParser::make_diff()),
       snapshot_(PayloadParser::make_snapshot()),
-      minify_buffer_(std::make_unique<char[]>(kMinifyCapacity)) {
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically sized reusable payload buffer
+      minify_buffer_(std::make_unique<char[]>(
+          kMinifyCapacity)) {  // NOLINT(modernize-avoid-c-arrays): dynamically sized preallocated
+                               // backing storage
     symbols_.reserve(outputs.size());
     for (auto& out : outputs) {
         symbols_.push_back(std::make_unique<PerSymbol>(config_.venue, std::move(out)));

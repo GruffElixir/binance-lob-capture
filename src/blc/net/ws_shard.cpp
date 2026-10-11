@@ -40,7 +40,7 @@ public:
         close_timer_.cancel();
         // Boost 1.74 retains its handshake/idle timer after a raw socket cancellation.
         // Disable both timers so an aborted handshake cannot keep io.run() alive.
-        websocket::stream_base::timeout timeout;
+        websocket::stream_base::timeout timeout{};
         timeout.handshake_timeout = websocket::stream_base::none();
         timeout.idle_timeout = websocket::stream_base::none();
         timeout.keep_alive_pings = false;
@@ -119,7 +119,7 @@ private:
         const auto owner = active();
         owner->state_ = State::WsHandshake;
         beast::get_lowest_layer(stream_).expires_never();
-        websocket::stream_base::timeout timeout;
+        websocket::stream_base::timeout timeout{};
         timeout.handshake_timeout = owner->tuning_.ws_handshake_timeout;
         timeout.idle_timeout = owner->tuning_.ws_idle_timeout;
         timeout.keep_alive_pings = true;

@@ -24,7 +24,7 @@ struct RecordHeader {
 // A record as seen by the processor: the payload stays valid until the record is released.
 struct RecordView {
     RecordHeader header;
-    PaddedView payload;
+    PaddedView payload{};
 };
 
 }  // namespace blc

@@ -4,7 +4,10 @@ namespace blc {
 
 RequestSlots::RequestSlots(std::size_t symbols)
     : size_(symbols),
-      slots_(std::make_unique<std::atomic<std::uint64_t>[]>(symbols)),
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically sized atomic slots
+      slots_(std::make_unique<std::atomic<std::uint64_t>[]>(
+          symbols)),  // NOLINT(modernize-avoid-c-arrays): dynamically sized preallocated backing
+                      // storage
       numbers_(symbols, 0),
       seen_(symbols, 0) {
     for (std::size_t i = 0; i < symbols; ++i) {

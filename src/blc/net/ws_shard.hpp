@@ -29,6 +29,8 @@ public:
     ~WsShard();
     WsShard(const WsShard&) = delete;
     WsShard& operator=(const WsShard&) = delete;
+    WsShard(WsShard&&) = delete;
+    WsShard& operator=(WsShard&&) = delete;
     void start();
     void shutdown();
     void finalize();  // after io.run(): close epoch accounting and release the transport

@@ -1,5 +1,6 @@
 #include "blc/core/decimal.hpp"
 
+#include <array>
 #include <cstddef>
 
 namespace blc {
@@ -10,7 +11,7 @@ constexpr bool is_digit(char c) noexcept {
 }
 
 constexpr int kScaleDigits = 8;
-constexpr std::int64_t kPow10[kScaleDigits + 1] = {
+constexpr std::array<std::int64_t, kScaleDigits + 1> kPow10 = {
     1, 10, 100, 1'000, 10'000, 100'000, 1'000'000, 10'000'000, 100'000'000};
 
 }  // namespace
@@ -59,7 +60,7 @@ DecimalError parse_e8(std::string_view text, std::int64_t& out) noexcept {
     for (std::size_t i = 0; i < used; ++i) {
         frac = frac * 10 + (frac_part[i] - '0');
     }
-    frac *= kPow10[kScaleDigits - static_cast<int>(used)];
+    frac *= kPow10[static_cast<std::size_t>(kScaleDigits) - used];
 
     std::int64_t scaled = 0;
     if (__builtin_mul_overflow(whole, kPow10[kScaleDigits], &scaled) ||

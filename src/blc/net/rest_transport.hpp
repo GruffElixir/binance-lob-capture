@@ -22,6 +22,10 @@ public:
     BeastRestTransport(boost::asio::io_context& io, boost::asio::ssl::context& tls,
                        JsonWorkspace& workspace, const NetTuning& tuning);
     ~BeastRestTransport() override;
+    BeastRestTransport(const BeastRestTransport&) = delete;
+    BeastRestTransport& operator=(const BeastRestTransport&) = delete;
+    BeastRestTransport(BeastRestTransport&&) = delete;
+    BeastRestTransport& operator=(BeastRestTransport&&) = delete;
 
     void get(const Endpoint& endpoint, std::string target,
              std::function<void(HttpResult)> done) override;

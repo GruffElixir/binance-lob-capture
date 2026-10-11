@@ -31,7 +31,7 @@ CsvReader::CsvReader(CsvReader&& other) noexcept
 
 CsvReader::~CsvReader() {
     if (file_ != nullptr) {
-        std::fclose(file_);
+        (void)std::fclose(file_);  // read-only handle; destructor cannot report a close error
     }
 }
 

@@ -28,12 +28,11 @@ std::string describe(const HttpResult& r) {
 
 }  // namespace
 
-RestScheduler::RestScheduler(boost::asio::io_context& io, Venue venue,
-                             const VenueEndpoints& endpoints, const NetTuning& tuning,
-                             RestTransport& transport, IoMetrics& metrics)
+RestScheduler::RestScheduler(boost::asio::io_context& io, Venue venue, VenueEndpoints endpoints,
+                             const NetTuning& tuning, RestTransport& transport, IoMetrics& metrics)
     : io_(io),
       venue_(venue),
-      endpoints_(endpoints),
+      endpoints_(std::move(endpoints)),
       tuning_(tuning),
       transport_(transport),
       metrics_(metrics),
@@ -41,7 +40,12 @@ RestScheduler::RestScheduler(boost::asio::io_context& io, Venue venue,
       timer_(io) {}
 
 RestScheduler::~RestScheduler() {
-    stop();
+    try {
+        stop();
+    } catch (...) {
+        // Destruction must still cancel transports if timer cancellation reports an error.
+        transport_.cancel_all();
+    }
 }
 
 void RestScheduler::validate_symbols(const std::vector<SymbolSpec>& symbols,
@@ -91,7 +95,7 @@ void RestScheduler::pump() {
         const std::string& name = symbols_.at(d->symbol).upper;
         std::string target = d->kind == RequestKind::Validation ? ticker_target(endpoints_, name)
                                                                 : depth_target(endpoints_, name);
-        std::weak_ptr<char> life = life_;
+        std::weak_ptr<char> const life = life_;
         const Dispatch dispatch = *d;
         transport_.get(endpoints_.rest, std::move(target),
                        [this, life, dispatch](HttpResult result) {
@@ -118,7 +122,7 @@ void RestScheduler::arm_timer() {
         return;
     }
     timer_.expires_at(wake);
-    std::weak_ptr<char> life = life_;
+    std::weak_ptr<char> const life = life_;
     timer_.async_wait([this, life](const boost::system::error_code& ec) {
         if (ec || life.expired() || stopping_) {
             return;

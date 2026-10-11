@@ -370,6 +370,17 @@ TEST(CaptureLoopback, AlreadyExpiredDuration) {
     EXPECT_EQ(server.count("ticker"), 0u);
     EXPECT_EQ(server.count("attempt"), 0u);
 }
+TEST(CaptureLoopback, FileDateUsesStartBeforeValidation) {
+    ServerScript script;
+    script.frames = frames();
+    LoopbackServer server(std::move(script), ca());
+    auto c = config(server, "start_date");
+    c.started_wall_ns =
+        1736899200LL * 1000000000;  // 2025-01-15 UTC, before current validation time
+    EXPECT_EQ(run_capture(c, std::chrono::steady_clock::now()), 0);
+    EXPECT_TRUE(
+        std::filesystem::exists(c.options.output_dir / "market_data_spot_BTCUSDT_2025-01-15.csv"));
+}
 void snapshot_retry_case(std::string bad, const std::string& name) {
     ServerScript script;
     script.frames = frames();

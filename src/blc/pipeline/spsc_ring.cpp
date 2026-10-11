@@ -14,8 +14,8 @@ constexpr std::size_t kHeaderBytes = 64;  // stored header area; payload starts 
 constexpr std::uint32_t kWrapMarker = 1;
 
 struct StoredHeader {
-    std::uint32_t total_bytes;  // this record (or wrap gap) including header and padding
-    std::uint32_t flags;        // kWrapMarker: skip to the start of the buffer
+    std::uint32_t total_bytes{};  // this record (or wrap gap) including header and padding
+    std::uint32_t flags{};        // kWrapMarker: skip to the start of the buffer
     RecordHeader header;
 };
 static_assert(sizeof(StoredHeader) <= kHeaderBytes, "stored header must fit its area");
@@ -94,7 +94,7 @@ bool SpscRing::try_push(const RecordHeader& header, std::string_view payload) no
     const std::uint64_t new_head = head + total;
     head_.store(new_head, std::memory_order_release);
 
-    const std::size_t used = static_cast<std::size_t>(new_head - cached_tail_);
+    const auto used = static_cast<std::size_t>(new_head - cached_tail_);
     if (used > high_water_.load(std::memory_order_relaxed)) {
         high_water_.store(used, std::memory_order_relaxed);
     }

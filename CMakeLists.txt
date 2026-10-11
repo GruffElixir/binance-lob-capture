@@ -31,6 +31,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(BLC_BUILD_TESTS "Build the unit tests (target: tests)" ON)
+option(BLC_BUILD_BENCH "Build reproducible performance benchmarks" OFF)
 option(BLC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 set(BLC_SANITIZER "" CACHE STRING "Sanitizers: empty, 'address,undefined' or 'thread'")
 
@@ -47,6 +48,9 @@ include(Sanitizers)
 add_subdirectory(third_party/simdjson)
 add_subdirectory(src)
 add_subdirectory(tools)
+if(BLC_BUILD_BENCH)
+    add_subdirectory(bench)
+endif()
 
 if(BLC_BUILD_TESTS)
     enable_testing()

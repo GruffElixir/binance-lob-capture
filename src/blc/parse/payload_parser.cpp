@@ -62,6 +62,7 @@ ParseStatus read_levels(value& v, LevelRule rule, ParseStatus when_full, Push&& 
         int index = 0;
         for (auto element_result : pair) {
             value element;
+            // NOLINTNEXTLINE(performance-move-const-arg): simdjson get() requires an rvalue
             if (std::move(element_result).get(element) != simdjson::SUCCESS || index >= 2) {
                 return ParseStatus::Malformed;
             }
@@ -181,7 +182,7 @@ ParseStatus PayloadParser::diff(Venue venue, PaddedView payload, std::string_vie
             return true;
         };
     };
-    ParseStatus st = visit_root(parser_, payload, [&](std::string_view key, value& v) {
+    ParseStatus const st = visit_root(parser_, payload, [&](std::string_view key, value& v) {
         if (key == "U") {
             return mark(seen, kU) ? read_u64(v, out.first_id) : ParseStatus::Malformed;
         }
@@ -236,7 +237,7 @@ ParseStatus PayloadParser::depth5(Venue venue, PaddedView payload, std::string_v
             return true;
         };
     };
-    ParseStatus st = visit_root(parser_, payload, [&](std::string_view key, value& v) {
+    ParseStatus const st = visit_root(parser_, payload, [&](std::string_view key, value& v) {
         if (key == id_key) {
             return mark(seen, kId) ? read_u64(v, out.id) : ParseStatus::Malformed;
         }
@@ -266,7 +267,7 @@ ParseStatus PayloadParser::trade(Venue /*venue*/, PaddedView payload, std::strin
                                  Trade& out) noexcept {
     enum : unsigned { kM = 1, kS = 2 };
     unsigned seen = 0;
-    ParseStatus st = visit_root(parser_, payload, [&](std::string_view key, value& v) {
+    ParseStatus const st = visit_root(parser_, payload, [&](std::string_view key, value& v) {
         if (key == "m") {
             if (!mark(seen, kM)) {
                 return ParseStatus::Malformed;
@@ -301,7 +302,7 @@ ParseStatus PayloadParser::snapshot(Venue /*venue*/, PaddedView payload,
             return true;
         };
     };
-    ParseStatus st = visit_root(parser_, payload, [&](std::string_view key, value& v) {
+    ParseStatus const st = visit_root(parser_, payload, [&](std::string_view key, value& v) {
         if (key == "lastUpdateId") {
             return mark(seen, kId) ? read_u64(v, out.last_update_id) : ParseStatus::Malformed;
         }

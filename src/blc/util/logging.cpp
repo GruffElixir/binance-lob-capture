@@ -2,6 +2,7 @@
 
 #include "blc/core/time.hpp"
 
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <mutex>
@@ -28,6 +29,8 @@ public:
     }
     HookScope(const HookScope&) = delete;
     HookScope& operator=(const HookScope&) = delete;
+    HookScope(HookScope&&) = delete;
+    HookScope& operator=(HookScope&&) = delete;
 
 private:
     LogAllocationHook hook_;
@@ -52,17 +55,19 @@ void write_prefix(std::ostream& os, LogLevel level) {
     if (sod < 0) {
         sod += 86'400;
     }
-    char buf[48];
-    std::snprintf(buf, sizeof buf, "T%02d:%02d:%02d.%03dZ ", static_cast<int>(sod / 3600),
-                  static_cast<int>((sod / 60) % 60), static_cast<int>(sod % 60),
-                  static_cast<int>(t.nsec / 1'000'000));
-    os << utc_date(now) << buf << level_name(level) << ' ';
+    std::array<char, 48> buf{};
+    const int n = std::snprintf(buf.data(), buf.size(), "T%02d:%02d:%02d.%03dZ ",
+                                static_cast<int>(sod / 3600), static_cast<int>((sod / 60) % 60),
+                                static_cast<int>(sod % 60), static_cast<int>(t.nsec / 1'000'000));
+    if (n < 0 || static_cast<std::size_t>(n) >= buf.size())
+        return;
+    os << utc_date(now) << buf.data() << level_name(level) << ' ';
 }
 
 void emit(const std::string& line) noexcept {
     const std::lock_guard<std::mutex> lock(g_write_mutex);
-    std::fwrite(line.data(), 1, line.size(), stderr);
-    std::fflush(stderr);
+    (void)std::fwrite(line.data(), 1, line.size(), stderr);  // best-effort diagnostics
+    (void)std::fflush(stderr);
 }
 
 }  // namespace

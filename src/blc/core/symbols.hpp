@@ -15,7 +15,7 @@ inline constexpr std::size_t kMaxSymbols = 256;
 struct SymbolSpec {
     std::string upper;  // as written to CSVs, e.g. "BTCUSDT"
     std::string lower;  // as used in stream names, e.g. "btcusdt"
-    std::int32_t id;    // instrument_id(venue, upper)
+    std::int32_t id{};  // instrument_id(venue, upper)
 };
 
 // Parses a --symbols list (design §2): comma-separated, case-insensitive, items trimmed,

@@ -36,6 +36,7 @@ public:
     CaptureRun(const CaptureConfig& config, std::chrono::steady_clock::time_point start)
         : config_(config),
           start_(start),
+          started_wall_ns_(config.started_wall_ns != 0 ? config.started_wall_ns : wall_clock_ns()),
           tls_(make_tls_client_context(config.tls)),
           signals_(io_, SIGINT, SIGTERM),
           duration_(io_),
@@ -89,6 +90,10 @@ public:
             shutdown();
         });
     }
+    CaptureRun(const CaptureRun&) = delete;
+    CaptureRun& operator=(const CaptureRun&) = delete;
+    CaptureRun(CaptureRun&&) = delete;
+    CaptureRun& operator=(CaptureRun&&) = delete;
     ~CaptureRun() {
         scheduler_.stop();
         for (auto& shard : shards_)
@@ -106,18 +111,19 @@ public:
                     shutdown();
             });
         }
-        scheduler_.validate_symbols(config_.options.symbols, [this](ValidationResult result) {
-            if (stopping_)
-                return;
-            if (result.kind != ValidationResult::Kind::Ok) {
-                log(LogLevel::Error, result.message);
-                fatal_.store(result.kind == ValidationResult::Kind::InvalidSymbol ? 2 : 1,
-                             std::memory_order_release);
-                shutdown();
-                return;
-            }
-            start_capture();
-        });
+        scheduler_.validate_symbols(
+            config_.options.symbols, [this](const ValidationResult& result) {
+                if (stopping_)
+                    return;
+                if (result.kind != ValidationResult::Kind::Ok) {
+                    log(LogLevel::Error, result.message);
+                    fatal_.store(result.kind == ValidationResult::Kind::InvalidSymbol ? 2 : 1,
+                                 std::memory_order_release);
+                    shutdown();
+                    return;
+                }
+                start_capture();
+            });
         try {
             io_.run();
         } catch (...) {
@@ -156,7 +162,7 @@ private:
     void start_capture() {
         const auto dir = prepare_output_dir(config_.options.output_dir);
         const auto now = wall_clock_ns();
-        const auto date = utc_date(now);
+        const auto date = utc_date(started_wall_ns_);
         std::vector<FileNames> names;
         std::vector<std::string> all_names;
         for (const auto& symbol : config_.options.symbols) {
@@ -255,6 +261,7 @@ private:
     }
     const CaptureConfig& config_;
     std::chrono::steady_clock::time_point start_;
+    std::int64_t started_wall_ns_;
     EnvelopeSplitter splitter_;
     asio::ssl::context tls_;
     asio::io_context io_;
@@ -279,10 +286,10 @@ private:
 }  // namespace
 
 std::size_t budget_mib(std::size_t symbols, std::size_t connections) {
-    constexpr std::size_t mib = 1024 * 1024;
+    constexpr std::size_t mib = std::size_t{1024} * 1024;
     const auto bytes = SpscRing::capacity_for_symbols(symbols) + 5 * mib + 6 * mib + 672000 +
                        65536 + mib + 8 * symbols + 883136 * symbols + 327680 * connections +
-                       mib * connections + 4 * 1114112 + 48 * mib;
+                       mib * connections + std::size_t{4} * 1114112 + 48 * mib;
     return (bytes + mib - 1) / mib;
 }
 int run_capture(const CaptureConfig& config, std::chrono::steady_clock::time_point started_at) {

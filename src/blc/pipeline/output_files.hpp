@@ -39,13 +39,16 @@ std::optional<std::filesystem::path> archive_existing(const std::filesystem::pat
 // soon as they end, so the scratch is always empty when another symbol's row starts.
 class SymbolFiles {
 public:
-    static constexpr std::size_t kBufferBytes = 64 * 1024;
+    static constexpr std::size_t kBufferBytes = std::size_t{64} * 1024;
 
     // Throws IoError if a file cannot be created.
     SymbolFiles(const std::filesystem::path& dir, const FileNames& names, char* sidecar_scratch,
                 std::size_t scratch_capacity);
     SymbolFiles(const SymbolFiles&) = delete;
+    ~SymbolFiles() = default;
     SymbolFiles& operator=(const SymbolFiles&) = delete;
+    SymbolFiles(SymbolFiles&&) = delete;
+    SymbolFiles& operator=(SymbolFiles&&) = delete;
 
     OutputFile& market_data() noexcept { return market_data_; }
     OutputFile& orderbook() noexcept { return orderbook_; }
@@ -59,8 +62,10 @@ public:
     bool finish() noexcept;  // flushes and closes all three; idempotent, failures sticky
 
 private:
-    std::unique_ptr<char[]> market_buffer_;
-    std::unique_ptr<char[]> book_buffer_;
+    std::unique_ptr<char[]> market_buffer_;  // NOLINT(modernize-avoid-c-arrays): dynamically sized
+                                             // preallocated backing storage
+    std::unique_ptr<char[]> book_buffer_;    // NOLINT(modernize-avoid-c-arrays): dynamically sized
+                                             // preallocated backing storage
     OutputFile market_data_;
     OutputFile orderbook_;
     OutputFile snapshots_;

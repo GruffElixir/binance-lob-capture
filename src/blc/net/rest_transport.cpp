@@ -121,7 +121,7 @@ private:
     }
 
     void on_read(const beast::error_code& ec) {
-        if (ec || stopped_) {
+        if (ec || stopped_ || !parser_.has_value()) {
             return fail();
         }
         HttpResult r;

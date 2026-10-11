@@ -79,9 +79,9 @@ public:
 
 private:
     struct Queued {
-        RequestKind kind;
-        std::uint16_t symbol;
-        std::uint64_t value;
+        RequestKind kind = RequestKind::Snapshot;
+        std::uint16_t symbol{};
+        std::uint64_t value{};
         Clock::time_point not_before;
     };
     struct SymbolState {

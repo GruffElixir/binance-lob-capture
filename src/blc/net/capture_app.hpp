@@ -13,6 +13,9 @@ struct CaptureConfig {
     VenueEndpoints endpoints;
     TlsConfig tls;
     NetTuning tuning;
+    // CLI supplies the wall clock before parsing/validation. Library callers may
+    // leave zero to use run_capture's entry time for the per-run UTC filename.
+    std::int64_t started_wall_ns = 0;
     std::function<std::unique_ptr<SymbolOutput>(const SymbolSpec&)> output_factory;
     std::function<void(std::uint16_t, std::size_t, bool)> buffer_capacity_observer;
 };

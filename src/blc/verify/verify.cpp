@@ -48,7 +48,7 @@ enum class FileKind { Unknown, Market, OrderBook, Sidecar };
 std::string join(const std::vector<std::string_view>& fields) {
     std::string s;
     for (std::size_t i = 0; i < fields.size(); ++i) {
-        s += i ? "," : "";
+        s += i != 0u ? "," : "";
         s.append(fields[i]);
     }
     return s;

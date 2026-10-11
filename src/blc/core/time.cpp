@@ -1,5 +1,8 @@
 #include "blc/core/time.hpp"
 
+#include "blc/core/errors.hpp"
+
+#include <array>
 #include <chrono>
 #include <cstdio>
 
@@ -50,19 +53,23 @@ UtcParts to_utc(std::int64_t ns) noexcept {
 
 std::string utc_date(std::int64_t ns) {
     const UtcParts p = to_utc(ns);
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "%04lld-%02u-%02u", static_cast<long long>(p.date.year),
-                  p.date.month, p.date.day);
-    return buf;
+    std::array<char, 32> buf{};
+    const int n = std::snprintf(buf.data(), buf.size(), "%04lld-%02u-%02u",
+                                static_cast<long long>(p.date.year), p.date.month, p.date.day);
+    if (n < 0 || static_cast<std::size_t>(n) >= buf.size())
+        throw IoError("cannot format UTC date");
+    return buf.data();
 }
 
 std::string utc_compact_stamp(std::int64_t ns) {
     const UtcParts p = to_utc(ns);
-    char buf[40];
-    std::snprintf(buf, sizeof buf, "%04lld%02u%02uT%02u%02u%02uZ",
-                  static_cast<long long>(p.date.year), p.date.month, p.date.day, p.hour, p.minute,
-                  p.second);
-    return buf;
+    std::array<char, 40> buf{};
+    const int n = std::snprintf(buf.data(), buf.size(), "%04lld%02u%02uT%02u%02u%02uZ",
+                                static_cast<long long>(p.date.year), p.date.month, p.date.day,
+                                p.hour, p.minute, p.second);
+    if (n < 0 || static_cast<std::size_t>(n) >= buf.size())
+        throw IoError("cannot format UTC stamp");
+    return buf.data();
 }
 
 std::int64_t wall_clock_ns() noexcept {

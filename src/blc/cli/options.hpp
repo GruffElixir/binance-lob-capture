@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,9 @@ struct ReplayOptions {
     std::filesystem::path output_dir = "./replay_output";
     bool trade_rows = true;
     int stats_interval_s = 10;
+    // Library-only benchmark hook. Empty in normal CLI replay; includes CSV decoding,
+    // attached snapshots and processing for each market-data row.
+    std::function<void(std::int64_t)> record_latency_observer;
 };
 
 enum class Mode { Capture, Replay, Help, Version };

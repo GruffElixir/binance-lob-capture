@@ -36,11 +36,13 @@ public:
         std::function<DeliveryResult(std::uint16_t symbol, std::uint32_t epoch, const HttpResult&)>;
     using FatalFn = std::function<void(std::string_view)>;
 
-    RestScheduler(boost::asio::io_context& io, Venue venue, const VenueEndpoints& endpoints,
+    RestScheduler(boost::asio::io_context& io, Venue venue, VenueEndpoints endpoints,
                   const NetTuning& tuning, RestTransport& transport, IoMetrics& metrics);
     ~RestScheduler();
     RestScheduler(const RestScheduler&) = delete;
     RestScheduler& operator=(const RestScheduler&) = delete;
+    RestScheduler(RestScheduler&&) = delete;
+    RestScheduler& operator=(RestScheduler&&) = delete;
 
     // Checks every symbol with a ticker request; `done` runs once: Ok when all are valid,
     // otherwise the first failure.
@@ -59,8 +61,8 @@ public:
 
 private:
     struct Waiting {
-        std::uint16_t symbol;
-        std::uint32_t epoch;
+        std::uint16_t symbol{};
+        std::uint32_t epoch{};
         HttpResult result;
         DispatchPolicy::Clock::time_point retry_at;
     };

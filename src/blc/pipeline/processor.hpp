@@ -81,7 +81,8 @@ public:
     std::size_t retained_bytes() const noexcept override { return SymbolFiles::kBufferBytes; }
 
 private:
-    std::unique_ptr<char[]> buffer_;
+    std::unique_ptr<char[]> buffer_;  // NOLINT(modernize-avoid-c-arrays): dynamically sized
+                                      // preallocated backing storage
     OutputFile file_;
     std::size_t market_rows_ = 0;
     bool finished_ = false;
@@ -126,7 +127,10 @@ public:
     Processor(ProcessorConfig config, std::vector<std::unique_ptr<SymbolOutput>> outputs,
               SnapshotRequester& requester);
     Processor(const Processor&) = delete;
+    ~Processor() = default;
     Processor& operator=(const Processor&) = delete;
+    Processor(Processor&&) = delete;
+    Processor& operator=(Processor&&) = delete;
 
     void process(const RecordView& record) noexcept;
 
@@ -162,7 +166,8 @@ private:
     Depth5 depth5_{};
     Trade trade_{};
     DepthSnapshot snapshot_;
-    std::unique_ptr<char[]> minify_buffer_;
+    std::unique_ptr<char[]> minify_buffer_;  // NOLINT(modernize-avoid-c-arrays): dynamically sized
+                                             // preallocated backing storage
     TopOfBook top_{};
     LatencyHistogram latency_;
     std::uint64_t md_rows_ = 0;

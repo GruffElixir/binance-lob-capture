@@ -97,6 +97,7 @@ inline simdjson::error_code consume_json_value(simdjson::ondemand::value& v,
             }
             for (auto element_result : arr) {
                 simdjson::ondemand::value element;
+                // NOLINTNEXTLINE(performance-move-const-arg): simdjson's get() is rvalue-qualified
                 if (auto e = std::move(element_result).get(element)) {
                     return e;
                 }

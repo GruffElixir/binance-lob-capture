@@ -18,11 +18,15 @@ namespace blc {
 // parsed in place. Positions are monotonically increasing 64-bit counters over a power-of-two
 // buffer. The busy path takes no lock; an idle consumer parks on a condition variable and the
 // producer notifies only when it is parked.
-class SpscRing {
+class SpscRing {  // NOLINT(clang-analyzer-optin.performance.Padding): deliberate cache-line
+                  // separation of producer/consumer atomics
 public:
     explicit SpscRing(std::size_t capacity_pow2);
     SpscRing(const SpscRing&) = delete;
+    ~SpscRing() = default;
     SpscRing& operator=(const SpscRing&) = delete;
+    SpscRing(SpscRing&&) = delete;
+    SpscRing& operator=(SpscRing&&) = delete;
 
     // 16 MiB for 1-64 symbols, 32 MiB for 65-128, 64 MiB above.
     static std::size_t capacity_for_symbols(std::size_t n) noexcept;
@@ -57,7 +61,10 @@ private:
 
     std::size_t capacity_;
     std::size_t mask_;
-    std::unique_ptr<unsigned char[], AlignedDelete> buffer_;
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays): aligned dynamically sized ring storage
+    std::unique_ptr<unsigned char[], AlignedDelete>
+        buffer_;  // NOLINT(modernize-avoid-c-arrays): dynamically sized preallocated backing
+                  // storage
 
     alignas(64) std::atomic<std::uint64_t> head_{0};  // written by the producer
     std::uint64_t cached_tail_ = 0;                   // producer's copy of tail_

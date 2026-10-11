@@ -126,7 +126,7 @@ DispatchPolicy::Clock::time_point DispatchPolicy::next_wakeup(Clock::time_point 
         return Clock::time_point::max();
     }
     refill(now);
-    Clock::time_point at = std::max({now, cooldown_until_, paused_until_});
+    Clock::time_point const at = std::max({now, cooldown_until_, paused_until_});
     if (in_use_ >= kDispatchSlots) {
         return Clock::time_point::max();  // a delivery or failure frees a slot first
     }

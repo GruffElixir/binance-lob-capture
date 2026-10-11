@@ -46,7 +46,9 @@ public:
 
 private:
     std::size_t size_;
-    std::unique_ptr<std::atomic<std::uint64_t>[]> slots_;
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays): dynamically sized atomic slots, reserved once
+    std::unique_ptr<std::atomic<std::uint64_t>[]>
+        slots_;  // NOLINT(modernize-avoid-c-arrays): dynamically sized preallocated backing storage
     std::vector<std::uint32_t> numbers_;  // processor side
     std::vector<std::uint64_t> seen_;     // io side
 };

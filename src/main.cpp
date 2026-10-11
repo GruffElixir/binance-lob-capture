@@ -2,6 +2,7 @@
 
 #include "blc/cli/options.hpp"
 #include "blc/core/errors.hpp"
+#include "blc/core/time.hpp"
 #include "blc/net/capture_app.hpp"
 #include "blc/replay/replay.hpp"
 #include "blc/version.hpp"
@@ -12,6 +13,7 @@
 
 int main(int argc, char* argv[]) {
     const auto started_at = std::chrono::steady_clock::now();
+    const auto started_wall_ns = blc::wall_clock_ns();
     try {
         const blc::Options options = blc::parse_options(argc, argv);
         switch (options.mode) {
@@ -26,6 +28,7 @@ int main(int argc, char* argv[]) {
             case blc::Mode::Capture:
                 blc::CaptureConfig config;
                 config.options = options.capture;
+                config.started_wall_ns = started_wall_ns;
                 config.endpoints = blc::default_endpoints(options.capture.venue);
                 return blc::run_capture(config, started_at);
         }

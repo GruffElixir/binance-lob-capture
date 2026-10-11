@@ -49,7 +49,7 @@ fs::path prepare_output_dir(const fs::path& dir) {
     // Permission bits alone do not tell (ACLs, read-only mounts): try to create a file.
     const fs::path probe = dir / ".binance_capture_write_probe";
     {
-        std::ofstream out(probe, std::ios::binary | std::ios::trunc);
+        std::ofstream const out(probe, std::ios::binary | std::ios::trunc);
         if (!out) {
             fail(dir, "output directory is not writable");
         }
@@ -96,7 +96,9 @@ std::optional<fs::path> archive_existing(const fs::path& dir, const std::vector<
 
 SymbolFiles::SymbolFiles(const fs::path& dir, const FileNames& names, char* sidecar_scratch,
                          std::size_t scratch_capacity)
+    // NOLINTNEXTLINE(modernize-avoid-c-arrays): preallocated writer buffer
     : market_buffer_(std::make_unique<char[]>(kBufferBytes)),
+      // NOLINTNEXTLINE(modernize-avoid-c-arrays): preallocated writer buffer
       book_buffer_(std::make_unique<char[]>(kBufferBytes)),
       market_data_(create_with_header(dir / names.market_data, market_buffer_.get(), kBufferBytes,
                                       kMarketDataHeader)),

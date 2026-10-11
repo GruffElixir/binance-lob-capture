@@ -96,6 +96,18 @@ TEST(Replay, GlobSkipsOrderbookFiles) {
     }
     EXPECT_EQ(files, 1u);
 }
+TEST(Replay, LibraryLatencyObserverCoversEveryMarketRow) {
+    CaptureRun r;
+    auto o = options({r.md()}, r.out.path());
+    std::vector<std::int64_t> latencies;
+    o.record_latency_observer = [&](std::int64_t ns) { latencies.push_back(ns); };
+    std::string err;
+    EXPECT_EQ(replay_capturing(o, err), 0) << err;
+    EXPECT_EQ(latencies.size(), split_lines(read_file(r.md())).size() - 1);
+    for (const auto ns : latencies)
+        EXPECT_GE(ns, 0);
+    EXPECT_EQ(read_file(r.replayed()), read_file(r.ob()));
+}
 
 TEST(Replay, OnlyOrderbookFilesIsUsageError) {
     CaptureRun r;

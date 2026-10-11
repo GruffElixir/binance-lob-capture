@@ -1,22 +1,23 @@
 #include "blc/parse/stream_table.hpp"
 
 #include <algorithm>
+#include <array>
 
 namespace blc {
 
 StreamTable::StreamTable(const std::vector<SymbolSpec>& shard_symbols,
                          std::uint16_t first_symbol_index) {
-    static constexpr std::pair<std::string_view, StreamKind> kSuffixes[] = {
+    static constexpr std::array<std::pair<std::string_view, StreamKind>, 3> kSuffixes = {{
         {"@depth@100ms", StreamKind::DepthDiff},
         {"@depth5@100ms", StreamKind::Depth5},
         {"@trade", StreamKind::Trade},
-    };
+    }};
     std::uint16_t index = first_symbol_index;
     for (const auto& symbol : shard_symbols) {
         for (const auto& [suffix, kind] : kSuffixes) {
             std::string name = symbol.lower + std::string(suffix);
             ordered_names_.push_back(name);
-            sorted_.push_back({std::move(name), StreamEntry{index, kind}});
+            sorted_.emplace_back(std::move(name), StreamEntry{index, kind});
         }
         ++index;
     }

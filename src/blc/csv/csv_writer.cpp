@@ -2,6 +2,7 @@
 
 #include "blc/core/errors.hpp"
 
+#include <array>
 #include <charconv>
 #include <cstring>
 #include <utility>
@@ -22,8 +23,11 @@ OutputFile OutputFile::create(const std::filesystem::path& path, char* buffer,
     if (f == nullptr) {
         throw IoError("cannot create output file: " + path.u8string());
     }
-    std::setvbuf(f, nullptr, _IONBF, 0);
-    return OutputFile(f, capacity == 0 ? nullptr : buffer, buffer == nullptr ? 0 : capacity);
+    if (std::setvbuf(f, nullptr, _IONBF, 0) != 0) {
+        (void)std::fclose(f);
+        throw IoError("cannot configure output buffering: " + path.u8string());
+    }
+    return {f, capacity == 0 ? nullptr : buffer, buffer == nullptr ? 0 : capacity};
 }
 
 OutputFile::OutputFile(OutputFile&& other) noexcept
@@ -119,17 +123,17 @@ void CsvRow::separator() noexcept {
 
 CsvRow& CsvRow::integer(std::int64_t value) noexcept {
     separator();
-    char buf[24];
-    const auto res = std::to_chars(buf, buf + sizeof buf, value);
-    file_.write(std::string_view(buf, static_cast<std::size_t>(res.ptr - buf)));
+    std::array<char, 24> buf{};
+    const auto res = std::to_chars(buf.data(), buf.data() + buf.size(), value);
+    file_.write(std::string_view(buf.data(), static_cast<std::size_t>(res.ptr - buf.data())));
     return *this;
 }
 
 CsvRow& CsvRow::unsigned_integer(std::uint64_t value) noexcept {
     separator();
-    char buf[24];
-    const auto res = std::to_chars(buf, buf + sizeof buf, value);
-    file_.write(std::string_view(buf, static_cast<std::size_t>(res.ptr - buf)));
+    std::array<char, 24> buf{};
+    const auto res = std::to_chars(buf.data(), buf.data() + buf.size(), value);
+    file_.write(std::string_view(buf.data(), static_cast<std::size_t>(res.ptr - buf.data())));
     return *this;
 }
 

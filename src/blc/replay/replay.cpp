@@ -77,15 +77,15 @@ bool parse_file_name(std::string_view name, Input& in) {
     return true;
 }
 
-std::optional<std::string> read_header(const fs::path& path) {
+std::string read_header(const fs::path& path) {
     CsvReader reader = CsvReader::open(path);
     std::vector<std::string_view> fields;
     if (!reader.next(fields)) {
-        return std::string();
+        return {};
     }
     std::string header;
     for (std::size_t i = 0; i < fields.size(); ++i) {
-        header += i ? "," : "";
+        header += i != 0u ? "," : "";
         header.append(fields[i]);
     }
     return header;
@@ -130,6 +130,8 @@ public:
         std::int64_t next_stats = started + stats_interval_ns();
         MarketRow row;
         while (true) {
+            const std::int64_t record_started =
+                options_.record_latency_observer ? steady_clock_ns() : 0;
             bool more = false;
             try {
                 more = md.next(fields);
@@ -149,6 +151,9 @@ public:
             }
             process(row.header, row.payload, payload_);
             ++rows_;
+            if (options_.record_latency_observer) {
+                options_.record_latency_observer(steady_clock_ns() - record_started);
+            }
             if ((rows_ & 4095) == 0 && stats_interval_ns() > 0 && steady_clock_ns() >= next_stats) {
                 log(LogLevel::Info, format_stats(processor_->stats(), nullptr, 0, 0,
                                                  (steady_clock_ns() - started) / kNanosPerSecond));
@@ -232,9 +237,9 @@ private:
 
     void inject_snapshots_before(std::uint64_t row) {
         while (have_snapshot_ && snapshot_.apply_before_row == row) {
-            RecordView v{snapshot_.header,
-                         PaddedView{snapshot_payload_.data(), snapshot_.payload.size(),
-                                    snapshot_payload_.size()}};
+            RecordView const v{snapshot_.header,
+                               PaddedView{snapshot_payload_.data(), snapshot_.payload.size(),
+                                          snapshot_payload_.size()}};
             processor_->process(v);
             check_fatal();
             read_sidecar();
@@ -320,7 +325,7 @@ int run_replay(const ReplayOptions& options) {
             fail(path, "cannot open the file");
             continue;
         }
-        std::optional<std::string> header;
+        std::string header;
         try {
             header = read_header(path);
         } catch (const std::exception& e) {
@@ -329,12 +334,12 @@ int run_replay(const ReplayOptions& options) {
             fail(path, e.what());
             continue;
         }
-        if (*header == kOrderBookHeader) {
+        if (header == kOrderBookHeader) {
             log(LogLevel::Info, "replay: skipping order-book file " + path.string());
             continue;
         }
         ++market_inputs;
-        if (*header != kMarketDataHeader) {
+        if (header != kMarketDataHeader) {
             any_failed = true;
             fail(path, "header is not the market-data header");
             continue;
@@ -378,6 +383,7 @@ int run_replay(const ReplayOptions& options) {
     try {
         out_dir = prepare_output_dir(options.output_dir);
         std::vector<std::string> names;
+        names.reserve(inputs.size());
         for (const Input& in : inputs) {
             names.push_back(in.output_name);
         }
