@@ -244,7 +244,7 @@ jobs:
         run: |
           set -euo pipefail
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          scripts/check_secrets.sh
+          scripts/check_credentials.sh
 
   valgrind:
     name: Valgrind (scenario replays)
