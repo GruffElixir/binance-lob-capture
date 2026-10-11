@@ -33,4 +33,4 @@ blc_set_warnings(unit_tests)
 add_custom_target(tests DEPENDS unit_tests)
 
 include(GoogleTest)
-gtest_discover_tests(unit_tests)
+gtest_discover_tests(unit_tests DISCOVERY_MODE PRE_TEST)

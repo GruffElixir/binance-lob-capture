@@ -38,6 +38,8 @@ jobs:
           - name: clang-15 / Release
             cxx: clang++-15
             extra_packages: clang-15
+    env:
+      CXX: ${{ matrix.cxx }}
     steps:
       - name: Install prerequisites
         run: |
@@ -57,17 +59,21 @@ jobs:
       - name: Build (log must be warning-free, third-party code included)
         shell: bash
         run: |
-          set -o pipefail
+          set -euo pipefail
           cmake --build build --parallel 2>&1 | tee build.log
           if grep -n "warning:" build.log; then
             echo "::error::the build log contains compiler warnings"
             exit 1
           fi
 
-      - name: Unit tests (README command)
+      - name: Unit tests (README command, as a non-root user so permission tests run)
+        shell: bash
         run: |
+          set -euo pipefail
           cmake --build build --target tests
-          ./build/tests/unit_tests
+          useradd -m tester
+          chmod -R a+rX build
+          su tester -c "./build/tests/unit_tests"
 
       - name: Smoke
         run: ./build/binance_capture --version
@@ -89,3 +95,55 @@ jobs:
 
       - name: Binary is at ./build/binance_capture
         run: ./build/binance_capture --version
+
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Install git and clang-format-15
+        run: |
+          apt-get update
+          apt-get install -y git clang-format-15
+
+      - uses: actions/checkout@v5
+
+      - name: Check formatting (vendored code excluded)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          clang-format-15 --dry-run --Werror $(git ls-files '*.cpp' '*.hpp' '*.hpp.in' ':!:third_party/**')
+
+  asan-ubsan:
+    name: ASan + UBSan (Debug)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+      # LeakSanitizer needs ptrace; seccomp=unconfined permits the setarch -R fallback.
+      options: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    env:
+      CXX: g++-12
+      BLC_TEST_TIME_SCALE: "10"
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y $README_APT_PACKAGES $CI_APT_PACKAGES util-linux
+
+      - uses: actions/checkout@v5
+
+      - name: Configure and build
+        run: |
+          cmake --preset asan
+          cmake --build build/asan --target unit_tests
+
+      - name: Unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Runner kernels with high vm.mmap_rnd_bits can make older sanitizer runtimes abort
+          # with "unexpected memory mapping"; disabling ASLR for the test process avoids it.
+          setarch "$(uname -m)" -R ./build/asan/tests/unit_tests
