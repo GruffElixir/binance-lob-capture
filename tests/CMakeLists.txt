@@ -16,7 +16,9 @@ FetchContent_MakeAvailable(googletest)
 
 # Lands at ./build/tests/unit_tests, the path used by the README and the reviewer checklist.
 add_executable(unit_tests
-    smoke_test.cpp)
+    smoke_test.cpp
+    core_time_test.cpp
+    core_instrument_id_test.cpp)
 target_link_libraries(unit_tests PRIVATE blc_core GTest::gtest_main)
 blc_set_warnings(unit_tests)
 

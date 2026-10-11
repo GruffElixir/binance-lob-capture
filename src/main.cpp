@@ -3,10 +3,10 @@
 // Scaffold entry point. The capture, order-book and replay pipeline is built milestone by
 // milestone; until then the binary only reports its version.
 
+#include "blc/version.hpp"
+
 #include <iostream>
 #include <string_view>
-
-#include "blc/version.hpp"
 
 int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
