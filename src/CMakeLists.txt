@@ -7,6 +7,7 @@ add_library(blc_core STATIC
     blc/book/diff_window.cpp
     blc/book/order_book.cpp
     blc/book/sequence.cpp
+    blc/book/symbol_book.cpp
     blc/cli/options.cpp
     blc/core/decimal.cpp
     blc/core/symbols.cpp
