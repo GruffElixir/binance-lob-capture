@@ -1122,7 +1122,7 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
   - A `poll_interval` io timer scans `RequestSlots` and the consumer's `fatal_code`. Stats print every `stats_interval_s`.
   - The final summary prints `VmHWM`, `budget_mib`, the `epoch_closed` lines and a totals line. It checks `frames_received == md_rows + malformed_frames + ring_drops`; on a violation it logs an error, and the exit code becomes 1.
 
-- [ ] **Step 1: Write a failing test** `tests/net_budget_test.cpp`: `budget_mib(1, 1) == 78` (77.1 exactly), `budget_mib(256, 64) == 423` (422.6), and `budget_mib(256, 6) == 347`.
+- [ ] **Step 1: Write a failing test** `tests/net_budget_test.cpp`: `budget_mib(1, 1) == 84` (83.1 exactly), `budget_mib(256, 64) == 429` (428.6), and `budget_mib(256, 6) == 353` (the formula includes the io thread's 6 MiB envelope-splitter fallback).
 - [ ] **Step 2: Implement** `budget_mib` and `run_capture` as in §6.7: `close_producer` runs after `run()` returns, and the processor drains. **Step 3:** Run the budget test. Expected: PASS.
 - [ ] **Step 4: Manual live run in WSL:** `./build/release/binance_capture --symbols BTCUSDT --duration 20 --output-dir /tmp/c1`. Expected: exit 0; three files; the order book starts with an `R` row; `blc_verify` passes on all files.
 - [ ] **Step 5: Commit** — `git commit -m "Add capture application and wire main"`

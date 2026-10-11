@@ -1020,6 +1020,7 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 |---|---|---|
 | WebSocket receive buffer, per connection (§6.2) | ≤ 256 KiB | ≤ 1 MiB while reading a message larger than 256 KiB |
 | TLS + WebSocket stream state, per connection (OpenSSL record buffers ≈ 2 × 17 KiB plus Beast state; an estimate, measured in M5) | ≈ 64 KiB | — |
+| Envelope splitter fallback (io thread, one per process): parser ≈ 5 MiB + 1 MiB scratch | ≈ 6 MiB | — |
 | REST dispatch slot, at most 4 (§6.3): in flight, or a completed body waiting for ring space | 0 once delivered or discarded | ≤ 1.1 MiB each (1 MiB body + ≈ 64 KiB TLS, rounded up); ≤ 4.4 MiB in total, including bodies waiting on a full ring |
 
 - **Default, up to 50 symbols** (1 connection): ≈ 0.3 MiB retained, ≤ 5.4 MiB transient (1 MiB WebSocket + 4 × 1.1 MiB REST).
@@ -1043,9 +1044,9 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
   A run fails otherwise. Sanitizer builds (ASan/LSan, TSan) are judged on lifecycle checks
   (no leaks, races or errors) and never against this budget, because their runtime memory
   (quarantine, redzones, shadow) is outside the native accounting.
-- **Example budgets:** the sum is computed in bytes and rounded up to whole MiB: 78 MiB for
-  one symbol on one connection (77.1 exactly), 423 MiB for 256 symbols on 64 connections
-  (422.6).
+- **Example budgets:** the sum is computed in bytes and rounded up to whole MiB: 84 MiB for
+  one symbol on one connection (83.1 exactly), 429 MiB for 256 symbols on 64 connections
+  (428.6).
 - The operating system commits pages only when they are touched, so a quiet symbol's resident
   memory stays below its reservation.
 - The `retained_bytes` gauge reports processor and ring storage plus the receive buffers'
