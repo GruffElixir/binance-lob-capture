@@ -16,7 +16,9 @@
 - Use only Boost 1.74 APIs (the jammy package). No Boost.JSON. Nothing from C++20 (`std::span`, `std::format`, `<bit>` functions newer than C++17, `std::atomic::wait`).
 - Everything is in namespace `blc`. Sources live in `src/blc/<module>/`; each test file is `tests/<module>_<unit>_test.cpp`, added to the `unit_tests` executable in `tests/CMakeLists.txt`.
 - No binary floating point on any path that produces a CSV integer. Prices and quantities are `int64` scaled by `100'000'000`.
-- **Exceptions:** only during startup and replay file opening (`blc::UsageError` → exit 2, `blc::IoError` → exit 1). The per-record path uses status enums and never throws.
+- **Exceptions:** allowed only at startup and in replay file handling (`blc::UsageError` → exit 2, `blc::IoError` → exit 1). A malformed replay row makes that one file fail; the capture path never throws. The per-record capture path uses status enums.
+- **Files** are always opened in binary mode (`"wb"` / `"rb"`), so MSYS2/Windows never rewrites line endings, and byte comparisons hold on every platform.
+- **Timing in tests:** no test asserts an exact count of time-driven events or a tight wall-clock deadline. Tests wait on events (for example "the server saw the ClientHello") and assert ordering plus generous upper bounds. Every deadline is multiplied by `BLC_TEST_TIME_SCALE` (default 1; the sanitizer CI jobs set 10).
 - **Exact strings** are copied from §3.3/§3.4/§3.5 and nowhere retyped. The headers live only in `src/blc/csv/schema.hpp`.
 - **Commits:** plain messages, imperative mood, **no `Co-Authored-By` or any Claude attribution**. Every commit leaves CI green.
 - **Forbidden string:** the reviewer's `git grep` pattern must never appear as a literal in any tracked file (§9).
@@ -30,7 +32,7 @@
 Inputs and failures the spec implies but no feature test would naturally hit. Each line's test is added to the task named.
 
 1. `--symbols " btcusdt , ETHusdt "` (spaces, mixed case) must be accepted as `BTCUSDT,ETHUSDT`, while `BTCUSDT,` (trailing comma) and `BTCUSDT,,ETH` are usage errors naming the empty item. → **Task 5**
-2. An unwritable or invalid `--output-dir` (the path is an existing regular file, or a directory without write permission) must fail at startup with exit 1 and a message naming the path, before any connection opens. → **Task 18**
+2. An unwritable or invalid `--output-dir` (the path is an existing regular file, or a directory without write permission) must fail at startup with exit 1 and a message naming the path, before any WebSocket opens. → **Task 18** (unit test; one CI job runs the tests as a non-root user so the permission case executes)
 3. A replay input saved by a Windows editor (CRLF line endings, missing final newline, trailing blank line) must replay to the same order book as the original. → **Task 4** (reader) and **Task 21** (replay)
 4. A receive timestamp that is an exact multiple of 1 s must give `tnsec == 0`, never `1000000000`. Dates around UTC midnight and 2000-02-29 / 2100-03-01 must format correctly. → **Task 1**
 5. A capture whose `--duration` ends before any symbol synchronises must exit 0. It leaves header-only order-book files and a summary with `syncs=0`; it must not report an error. → **Task 27**
@@ -245,7 +247,10 @@ TEST(Options, EqualsForm) { const char* a[] = {"bc", "--venue=usdm", "--symbols=
   auto o = parse_options(4, a); EXPECT_EQ(o.capture.venue, Venue::Usdm); EXPECT_EQ(o.capture.duration_s, 300); }
 TEST(Options, ReplayDefaults) { const char* a[] = {"bc", "--replay", "x.csv", "y.csv"}; auto o = parse_options(4, a);
   EXPECT_EQ(o.mode, Mode::Replay); EXPECT_EQ(o.replay.inputs.size(), 2u); EXPECT_EQ(o.replay.output_dir, "./replay_output"); }
+TEST(Options, AllFlagsParsed) { /* --no-trade-rows -> trade_rows false; --stats-interval 0; --fault-reconnect-every 30;
+  --help -> Mode::Help; --version -> Mode::Version */ }
 TEST(Options, UsageErrors) { /* each throws UsageError:
+  --symbols-per-connection 342; 257 symbols; --stats-interval -1; --fault-reconnect-every -1;
   unknown flag; --venue coin; --duration -1; --duration 2678401; --symbols missing in capture;
   --symbols-per-connection 0; 256 symbols with --symbols-per-connection 1 (65+ connections > 64);
   --replay with no files; --replay combined with --symbols; flag without value */ }
@@ -266,9 +271,11 @@ TEST(Options, UsageErrors) { /* each throws UsageError:
 - Modify: `.github/workflows/ci.yml`, plus every C++ file (formatting only)
 
 - [ ] **Step 1:** Run `clang-format -i` over `src/` and `tests/`, and check that `git diff` shows formatting only.
-- [ ] **Step 2: Add the `format` job.** It installs `clang-format-15` in `ubuntu:22.04` and runs `clang-format-15 --dry-run --Werror $(git ls-files '*.cpp' '*.hpp' '*.hpp.in' ':!:third_party/**')`. The pathspec excludes vendored code from the start.
+- [ ] **Step 2: Add the `format` job.** It installs `git` (so `actions/checkout` produces a real repository) and `clang-format-15` in `ubuntu:22.04`, then runs `clang-format-15 --dry-run --Werror $(git ls-files '*.cpp' '*.hpp' '*.hpp.in' ':!:third_party/**')`. The pathspec excludes vendored code from the start.
 - [ ] **Step 3: Add the `asan-ubsan` job.**
-  - Install the README packages, set `CXX=g++-12`, configure with `cmake --preset asan`, build, and run `./build/asan/tests/unit_tests`.
+  - Install the README packages, set `CXX=g++-12` (every CI job sets `CXX` explicitly from now on), configure with `cmake --preset asan`, build, and run `./build/asan/tests/unit_tests`. The job uses `options: --cap-add=SYS_PTRACE` (LeakSanitizer and, later, `strace` need it) and `BLC_TEST_TIME_SCALE=10`.
+  - Switch `gtest_discover_tests` to `DISCOVERY_MODE PRE_TEST` in `tests/CMakeLists.txt`, so discovery never runs a sanitized binary at build time.
+  - Make the existing `gcc-12` job run `unit_tests` as a non-root user (`useradd -m tester && su tester -c ./build/tests/unit_tests`), so permission tests execute.
   - Environment: `ASAN_OPTIONS=detect_leaks=1:abort_on_error=1` and `UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1`.
   - If the sanitizer runtime aborts with "unexpected memory mapping" (high `vm.mmap_rnd_bits` on the runner kernel), run the test binary under `setarch "$(uname -m)" -R` and note why in the workflow.
 - [ ] **Step 4: Push** and run `gh run watch`. Expected: all jobs green.
@@ -385,7 +392,7 @@ TEST(Payload, SpotDepth5IdIsLastUpdateId) { /* id == lastUpdateId; n_bids == 5 *
 TEST(Payload, UsdmDepth5IdIsU) { /* id == fixture "u", even though e == "depthUpdate" */ }
 TEST(Payload, TradeMaker) { /* spot fixture m:true -> buyer_is_maker true */ }
 TEST(Payload, FieldOrderIndependent) { /* reorder keys of the spot diff -> identical DepthDiff */ }
-TEST(Payload, Errors) { /* missing "u" -> Malformed; duplicate "U" -> Malformed; "p":"1e5" -> BadDecimal;
+TEST(Payload, Errors) { /* missing "u" -> Malformed; duplicate "U" -> Malformed; a diff level ["1e5","1"] -> BadDecimal;
   "s":"ETHUSDT" for BTCUSDT -> SymbolMismatch; level ["1"] -> Malformed; trailing "}x" -> Malformed;
   depth5 with 6 bids -> Malformed */ }
 TEST(Payload, OversizedDiffRejectedNotTruncated) { /* 20 001 levels -> Oversized; 20 000 -> Ok with 20 000 */ }
@@ -459,7 +466,8 @@ TEST(Payload, ScratchNeverGrows) { /* capacity of out.bids before and after a 20
 ```cpp
 TEST(Coverage, ShortSnapshotIsComplete) { /* 3 bids with limit 1000 -> complete; top5 pads {0,0}; authoritative */ }
 TEST(Coverage, FullSnapshotBounded) { /* 1000 bids 1000..1 -> boundary 1; margin 1000 */ }
-TEST(Coverage, ExhaustionAfterDeletes) { /* delete 996 best -> margin 4 -> !authoritative even though a level below the boundary was later added by a diff */ }
+TEST(Coverage, ExhaustionAfterDeletes) { /* snapshot bids 2000..1001 (1000 levels, boundary 1001); delete the 996 best -> margin 4
+  -> !authoritative, even though a diff then adds bid 1000, below the boundary (it does not count) */ }
 TEST(Coverage, TrimCompleteSideRevokesCompleteness) { /* complete side grows to 5001 via diffs -> trimmed to 4000,
   complete == false, boundary == worst retained; then deleting down to 4 levels -> !authoritative (no zero padding) */ }
 TEST(Coverage, TrimBeyondBoundaryKeepsBoundary) { /* trimmed levels all worse than boundary -> boundary unchanged */ }
@@ -567,7 +575,7 @@ TEST(Depth5Check, PartialDetectsUntouchedDifference) { /* untouched price 8 qty 
   - `struct SymbolCounters { std::uint64_t stale_diffs, gaps, resets, syncs, resyncs, snapshot_too_old, coverage_exhausted, window_resets, depth5_verified, depth5_partially_verified, depth5_mismatch, depth5_stale, depth5_unchecked, depth5_levels_unchecked, parse_errors, oversized_events, epoch_regressions; };`
   - `enum class Depth5Policy { Resync, CountOnly };` and `constexpr Depth5Policy depth5_policy(Venue) noexcept;` — both venues `Resync` (§5.6, §15).
   - `class SymbolBook`:
-    - `SymbolBook(Venue, SymbolCounters&, Depth5Policy = depth5_policy(venue));` (the parameter exists so tests can exercise `CountOnly`).
+    - `SymbolBook(Venue, SymbolCounters&);` delegates to `SymbolBook(Venue, SymbolCounters&, Depth5Policy);`. A default argument cannot name another parameter; the second constructor lets tests exercise `CountOnly`.
     - `enum class EpochCheck { Same, Reset, Regression };`
     - `EpochCheck observe_epoch(std::uint32_t epoch) noexcept;` — the last-seen epoch starts as none, so the first call returns `Reset`. The caller then runs `enter_unsynced(NewEpoch)` and requests a snapshot.
     - `Emit on_diff(const DepthDiff&) noexcept;`
@@ -629,18 +637,16 @@ TEST(Sync, CountOnlyPolicyDoesNotResync) { /* Depth5Policy::CountOnly; mismatch 
     - `Step next();` — random walk around a mid price, with deep resting levels that are never touched.
     - `TopOfBook true_top() const;`
     - `void inject_gap();` — the next diff skips ids. `void inject_reconnect();` — the next step is `Reconnect`.
-    - `bool covered_top5_known(const DepthSnapshot& served, std::uint64_t since_id) const;` — the simulator's own, independent answer to "could a book built from this snapshot plus every diff since still show the true top 5?". It is true when the true top-5 prices all lie within the served snapshot's range, or were touched by a diff after it.
+    - `bool coverage_sufficient(const DepthSnapshot& served) const;` — an independent re-statement of §5.3 from the simulator's own data. Each side of the served snapshot is complete if it held fewer than 1 000 levels. Otherwise its boundary is the snapshot's worst price, and the side is sufficient only if the **true** book currently has ≥ 5 levels at or better than that boundary. Diff-created levels beyond the boundary never count.
+    - The simulator keeps each true side ≤ 4 000 levels, so trimming never occurs here (it is unit-tested in Task 11).
   - Snapshots are truncated to 1 000 levels. usdm ids skip values, and `pu` chains. Gaps and reconnects are injected at random (about 1 per 2 000 steps).
 
 - [ ] **Step 1: Write the test.** For seeds 1..20 and both venues, run 10⁴ steps each, feeding `SymbolBook` and requesting snapshots when `snapshot_wanted()`. The simulator answers snapshot requests two steps later. Assert after every step:
   - **No wrong output:** if a row was emitted, `book.top5()` equals `sim.true_top()`.
-  - **No needless suppression:** if no row was emitted for a market record, one of these holds:
-    - no snapshot has been served since the start, the last injected gap or the last reconnect, plus up to 3 steps to bridge;
-    - `covered_top5_known(...)` is false (true coverage exhaustion, judged by the simulator).
-
-    Any other suppressed step fails the test, with the seed and step number.
-  - **Liveness:** after every gap or reconnect, the book is Synced again within 5 steps of the snapshot being served.
-  - **Consistency:** `depth5_mismatch == 0` across all seeds, and `sum(syncs) == 1 + injected gaps + reconnects + coverage exhaustions` per run.
+  - **Exhaustion matches the oracle:** the book enters Unsynced with cause `CoverageExhausted` at step *k* exactly when `coverage_sufficient(last served snapshot)` turns false at *k*.
+  - **No needless suppression:** a market record may go without a row only while the book is in an *unsynced interval*. Such an interval opens at the start or at any `enter_unsynced` (any cause) and closes when the book is Synced again. Any row withheld outside an interval fails the test, with the seed and step number.
+  - **Liveness:** within each interval, once a snapshot has been served, the book is Synced at the first diff that bridges it. The simulator knows which diff that is, regardless of how many depth5 or trade steps come in between.
+  - **Consistency:** `depth5_mismatch == 0` across all seeds, and `syncs == 1 + (number of Synced → Unsynced transitions)` per run. Gaps or reconnects injected while the book is already Unsynced add no transition.
 - [ ] **Step 2: Run** `--gtest_filter='BookProperty*'`. Expected: PASS. A failure is a real bug: fix it in Tasks 10–14 code with a regression test, never in the simulator.
 - [ ] **Step 3: Commit** — `git commit -m "Add exchange-simulator property test for the book"`
 
@@ -710,7 +716,8 @@ TEST(SpscRing, TwoThreadStress) { /* producer pushes 10^6 sequence-numbered reco
     - `enum class FrameResult { Pushed, Unsubscribed, LostNow, Withheld };`
     - `FrameResult on_frame(std::string_view frame, std::int64_t recv_ns, std::int64_t steady_ns) noexcept;`
     - `bool lost() const noexcept;`
-    - `bool can_deliver_snapshot(std::uint32_t epoch) const noexcept;` — `epoch` is current and there has been no loss.
+    - `void on_disconnected() noexcept;` — called by `WsShard` on any read error, close or loss. It clears the `established` flag.
+    - `bool can_deliver_snapshot(std::uint32_t epoch) const noexcept;` — `epoch` is current, the connection is established, and there has been no loss (§6.3).
     - `bool push_snapshot(std::uint16_t symbol, std::uint32_t epoch, std::string_view body, std::int64_t recv_ns) noexcept;` — false if the ring is full.
     - `EpochStats close_epoch() noexcept;` — the caller logs the `epoch_closed` line.
 
@@ -721,6 +728,8 @@ TEST(FrameRouter, AssignsConnSeqAndPushes) { /* 3 frames -> conn_seq 0,1,2 in ri
 TEST(FrameRouter, UnsubscribedCountedNotLost) { /* valid envelope, unknown stream -> Unsubscribed, conn_seq consumed */ }
 TEST(FrameRouter, InvalidEnvelopeIsLoss) { /* -> LostNow; next frame -> Withheld; ring unchanged; drops counted */ }
 TEST(FrameRouter, RingFullIsLoss) { /* tiny ring; push fails -> LostNow; can_deliver_snapshot(epoch) == false */ }
+TEST(FrameRouter, NoDeliveryAfterDisconnect) { /* on_connected(0); on_disconnected(); can_deliver_snapshot(0) == false;
+  on_connected(1) -> can_deliver_snapshot(1) == true, can_deliver_snapshot(0) == false */ }
 TEST(FrameRouter, NewConnectionClearsLoss) { /* on_connected(1) -> not lost; conn_seq restarts at 0 */ }
 TEST(FrameRouter, AccountingInvariant) { /* frames == pushed + malformed + drops for the closed epoch */ }
 TEST(FrameRouter, ReversedEnvelopeSameRecord) { /* {"data":…,"stream":…} and the forward form of the same frame push
@@ -749,7 +758,7 @@ TEST(FrameRouter, ReversedEnvelopeSameRecord) { /* {"data":…,"stream":…} and
   - `std::filesystem::path prepare_output_dir(const std::filesystem::path&);` — creates the directory, checks it is writable, throws `IoError` naming the path.
   - `std::optional<std::filesystem::path> archive_existing(const std::filesystem::path& dir, const std::vector<std::string>& names, std::string_view run_stamp);` — moves every existing name into one `replaced_<stamp>[-k]/` directory. It is called **once per run** with the names of all symbols, so a run never creates more than one archive directory.
   - `class SymbolFiles` — owns three `OutputFile`s and their headers. The market-data and order-book files each get a 64 KiB buffer.
-    - The sidecar `OutputFile` is built over the shared 64 KiB scratch passed in, and `SymbolFiles::end_snapshot_row()` flushes it as soon as each row ends.
+    - The sidecar `OutputFile` is built over the shared 64 KiB scratch passed in. It is flushed right after its header is written, and `SymbolFiles::end_snapshot_row()` flushes it as soon as each row ends. A chunked row longer than 64 KiB is written out chunk by chunk by `OutputFile::write`.
     - The processor writes one sidecar row at a time, on one thread. The shared scratch is therefore always empty when another symbol's row starts, so rows of different symbols can never mix (§6.6).
 
 - [ ] **Step 1: Write failing tests**
@@ -760,7 +769,9 @@ TEST(OutputFiles, ArchiveWholeSetKeepsNames) { /* create the three files; archiv
   under original names; dir no longer has them */ }
 TEST(OutputFiles, ArchivePartialSetAndCollision) { /* only the orderbook exists -> moved; second archive same stamp -> "-1" suffix */ }
 TEST(OutputFiles, OutputDirIsAFile) { /* prepare_output_dir(existing regular file) throws IoError containing the path */ }
-TEST(OutputFiles, OutputDirNotWritable) { /* chmod 0555 dir (POSIX only; GTEST_SKIP when running as root) -> IoError */ }
+TEST(OutputFiles, OutputDirNotWritable) { /* chmod 0555 dir (POSIX only; GTEST_SKIP when euid==0 — the non-root CI job runs it) -> IoError */ }
+TEST(OutputFiles, SidecarHeadersSurviveSharedScratch) { /* two symbols with different venue/symbol in their paths: create both, then write a
+  70 KiB row to the second -> both files start with their exact header */ }
 TEST(OutputFiles, HeadersWritten) { /* new SymbolFiles -> each file's first line is its schema header + "\n" */ }
 TEST(OutputFiles, ArchiveOncePerRunForAllSymbols) { /* BTC and ETH sets exist; one archive_existing call with all six names
   -> exactly one replaced_<stamp>/ holding all six */ }
@@ -777,7 +788,7 @@ TEST(OutputFiles, SharedSidecarScratchKeepsRowsSeparate) { /* two SymbolFiles ov
 
 **Files:**
 - Create: `src/blc/pipeline/snapshot_requester.hpp`, `src/blc/pipeline/snapshot_requester.cpp`, `src/blc/pipeline/processor.hpp`, `src/blc/pipeline/processor.cpp`, `src/blc/pipeline/row_format.hpp`, `src/blc/pipeline/row_format.cpp`
-- Test: `tests/pipeline_processor_test.cpp`, `tests/pipeline_loss_integration_test.cpp`, `tests/pipeline_allocation_test.cpp`, `tests/support/counting_allocator.cpp`
+- Test: `tests/pipeline_processor_test.cpp`, `tests/pipeline_loss_integration_test.cpp`, `tests/pipeline_allocation_test.cpp`, `tests/support/counting_allocator.cpp`, `tests/support/loss_scenario.hpp`, `tests/support/loss_scenario.cpp` (`void write_loss_scenario(const std::filesystem::path& dir);`, shared with Task 21)
 
 **Interfaces:**
 - Consumes: everything in M1–M4 so far.
@@ -801,14 +812,16 @@ TEST(OutputFiles, SharedSidecarScratchKeepsRowsSeparate) { /* two SymbolFiles ov
     - `void flush() noexcept;`
     - `bool finish() noexcept;` — flush and close, checked.
     - `const SymbolCounters& counters(std::size_t symbol) const;`
-    - `std::string stats_line() const;` — the `key=value` format of §8.
+    - `ProcessorStats stats() const;` — processor counters summed over symbols, `retained_bytes()` (the capacity sum of every processor and per-symbol container), and the latency histogram.
+  - `class LatencyHistogram` — fixed log2 buckets (64), `void add(std::int64_t ns) noexcept`, `std::int64_t percentile(double p) const noexcept` (bucket upper bound). The processor adds `wall steady now − header.steady_ns` per record after its row is written; replay records carry no steady time and add nothing.
+  - `std::string format_stats(const ProcessorStats&, const IoMetrics* io, std::size_t ring_hw_bytes, std::int64_t uptime_s);` — the §8 `key=value` line. `io == nullptr` (replay) omits io keys.
   - `row_format.hpp`: `void write_book_row(CsvRow&, std::int64_t recv_ns, std::uint64_t seq, std::int32_t id, char type, char side, const TopOfBook&);` — 26 columns.
 
 - [ ] **Step 1: Write failing tests**
 
 ```cpp
 TEST(Processor, MarketRowBeforeParseEvenOnParseError) { /* malformed trade payload -> market row written, no book row */ }
-TEST(Processor, BookRowFormat) { /* synced book + P record -> row "tsec,tnsec,0,2014473836,P,N,<20 ints>" with exactly 25 commas */ }
+TEST(Processor, BookRowFormat) { /* synced book: the R row has seqNo 0; the following P record -> row "tsec,tnsec,1,2014473836,P,N,<20 ints>" with exactly 25 commas */ }
 TEST(Processor, SeqNoPerSymbol) { /* two symbols interleaved -> each file's seqNo 0,1,2 */ }
 TEST(Processor, SidecarApplyBeforeRow) { /* 3 market rows then a snapshot -> sidecar apply_before_row == 3 */ }
 TEST(Processor, RequestsThroughSlots) { /* first record -> RequestSlots holds (0,1); after a snapshot record and a gap -> (0,2) */ }
@@ -816,10 +829,12 @@ TEST(Processor, PerSymbolEpochIsolation) { /* BTC epoch-1 record does not reset 
 TEST(Processor, WriterFailureSetsFatal) { /* SymbolOutput reporting failed() -> fatal(), later records ignored */ }
 TEST(Processor, PrettyPayloadMinified) { /* payload with spaces and newlines -> the market row holds the one-line minified
   form; payloads_minified==1; parsing still succeeds */ }
-TEST(Processor, StatsLineKeys) { /* stats_line() contains every §8 key: frames md_rows ob_rows parse_errors gaps resyncs
+TEST(Processor, StatsLineKeys) { /* format_stats with an IoMetrics contains every §8 key: frames md_rows ob_rows parse_errors gaps resyncs
   reconnects coverage_exhausted depth5_verified depth5_mismatch ring_drops ring_hw_kib retained_kib lat_p50_us lat_p99_us */ }
+TEST(LatencyHistogram, Percentiles) { /* 1..1000 us uniform -> p50 within its bucket bounds of 500 us; p99 >= p50; empty -> 0 */ }
+TEST(Processor, RetainedBytesStable) { /* retained_bytes() equals its value at construction after 10^4 records (nothing grows) */ }
 TEST(LossIntegration, DroppedDiffThenTradeEmitsNoStaleRow) {
-  // spec §13 'loss' scenario: FrameRouter -> tiny SpscRing -> Processor (CSVs to a temp dir); ring full when a diff
+  // spec §13 'loss' scenario via write_loss_scenario(tmp): FrameRouter -> tiny SpscRing -> Processor; ring full when a diff
   // deleting the best bid arrives; then a trade frame; expect the trade Withheld, no book row containing the old
   // best bid; after on_connected(1) + new frames the symbol resyncs. The replay half of this scenario is in Task 21.
 }
@@ -844,7 +859,7 @@ TEST(Allocations, ProcessorPathAllocatesNothing) {
 **Interfaces:**
 - Consumes: `SpscRing` (Task 16), `Processor` (Task 19).
 - Produces:
-  - `struct ConsumerConfig { std::function<std::int64_t()> steady_now_ns; std::chrono::milliseconds flush_every{1000}; std::chrono::seconds stats_every{10}; std::function<void(const std::string&)> on_stats; };` — the clock is injectable, so tests don't sleep.
+  - `struct ConsumerConfig { std::function<std::int64_t()> steady_now_ns; std::chrono::milliseconds flush_every{1000}; std::chrono::seconds stats_every{10}; std::function<void(const std::string&)> on_stats; };` — the clock is injectable, so tests don't sleep. `stats_every == 0s` means no periodic line, only the final summary (`--stats-interval 0`).
   - `int run_consumer(SpscRing&, Processor&, std::atomic<int>& fatal_code, const ConsumerConfig&) noexcept;` — the processor thread's body, implementing §6.7 steps 4–5:
     - peek → `process` → `pop`;
     - when the ring is empty, `ring.wait(50 ms)`;
@@ -882,11 +897,14 @@ TEST(Consumer, ConcurrentProducerUnderTsan) { /* producer thread pushes 10^5 rec
 - Consumes: `CsvReader`, `Processor`, `BookOnlyOutput`, `NullRequester`, `ReplayOptions`.
 - Produces:
   - `int run_replay(const ReplayOptions&);` — returns 0, 1 or 2 per §7.
+    - Venue and symbol come from the file name `market_data_<venue>_<SYMBOL>_<date>.csv`; every row must agree, or that file fails.
+    - A header-only input replays to a header-only order book.
+    - Stats lines print every `stats_interval_s` during long replays, and a per-file final summary (`format_stats` with `io == nullptr`) prints at the end.
   - `blc_verify <file>...` detects the file type from its header and exits 0 or 1. It streams through `CsvReader`, so memory stays bounded. Checks:
     - **All files:** exact header, column count on every row, full RFC 4180 parse, `tnsec`/`recv_tnsec` in [0, 999 999 999].
     - **Market data:** `venue` ∈ {spot, usdm}; `stream_kind` ∈ {depth_diff, depth5, trade}; `symbol` uppercase `[A-Z0-9]{2,20}` and constant per file; `payload_json` one line (no CR/LF) and valid JSON; `conn_seq` strictly increasing within each (shard, epoch); epochs non-decreasing.
     - **Order book:** `seqNo` contiguous from 0; `id` constant; `type` ∈ {R,D,P,T}; `side` ∈ {B,S,N}; the first row is `R`; non-zero bids strictly descending and asks strictly ascending; zero padding only after the last non-zero level, with price and size both 0.
-    - **Sidecar:** `apply_before_row` non-decreasing.
+    - **Sidecar:** `apply_before_row` non-decreasing and ≤ the paired market-data file's row count (when that file is given too).
     - **With `--epoch-log <stderr-log>`:** the frame-accounting invariant per (shard, epoch) against the `epoch_closed` lines.
 
 - [ ] **Step 1: Write failing tests**
@@ -899,8 +917,10 @@ TEST(Replay, MissingSidecarFails) { /* -> exit 1, message names the sidecar */ }
 TEST(Replay, NonMonotonicApplyBeforeRowRejected) { /* -> exit 1 */ }
 TEST(Replay, CrlfInputSameOutput) { /* converting a fixture to CRLF and dropping the final newline -> byte-identical output */ }
 TEST(Replay, ExistingOutputArchived) { /* second replay into the same dir -> replaced_<stamp>/ created */ }
-TEST(Replay, LossIntegrationReplaysIdentically) { /* the CSVs produced by Task 19's LossIntegration test, replayed,
-  give a byte-identical order book */ }
+TEST(Replay, LossIntegrationReplaysIdentically) { /* tests/support/loss_scenario.{hpp,cpp}: write_loss_scenario(dir) runs the Task 19 loss
+  pipeline into dir (shared with LossIntegration, so neither test depends on the other's files); replaying dir -> byte-identical order book */ }
+TEST(Replay, SkipsByOrderbookHeader) { /* a file named market_data_x.csv whose header is the order-book header -> skipped with an info line */ }
+TEST(Replay, HeaderOnlyInput) { /* -> header-only output, exit 0 */ }
 TEST(Replay, ArchivedRunReplaysFromArchiveDir) { /* built at test time, not as a fixture (git ignores replaced_*/):
   write run 1's three files, archive_existing them as a second run would, then replay
   replaced_<stamp>/market_data_*.csv -> equals run 1's order book */ }
@@ -943,12 +963,14 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
 - [ ] **Step 1: Write `tests/scenarios_test.cpp`.** For each scenario directory, replay every file in `input/` into a temp dir. Each produced `<stem>_orderbook.csv` must equal, byte for byte, the file of the same name in `expected/`, and the two directories must hold the same set of files.
 - [ ] **Step 2: Author the scenarios one by one.** Per scenario: write the inputs, write the expected rows by hand, run `--gtest_filter='Scenarios*'`, and fix code (never expectations) until it passes.
 - [ ] **Step 3: Add CI.**
-  - `output-contract` (installs `strace`):
+  - `output-contract` (installs `strace`; `options: --cap-add=SYS_PTRACE`; `CXX=g++-12`):
     - build Release;
     - run scenario replays through the `market_data_*.csv` glob;
     - run `blc_verify` on all outputs;
     - run `strace -f -e trace=socket -o strace.log ./build/binance_capture --replay ...`, then `! grep -q 'socket(' strace.log`;
     - run the secrets grep with the pattern assembled in the script from fragments. Every step uses `set -euo pipefail` and `grep -q`, never `grep -c`, whose exit status 1 on zero matches breaks `-e`.
+    - run `scripts/verify_outputs.sh` on every replay output (exact headers, `awk -F',' 'NR==2{print NF}'` = 26, `blc_verify`);
+    - check that the `-E` reading of the secrets pattern (assembled at runtime) matches nothing outside `docs/`, `README.md` and `.gitignore`, so the README's claim stays true.
   - `valgrind` (installs `valgrind`): `valgrind --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect` over the scenario replays.
 - [ ] **Step 4: Push** and run `gh run watch`. Expected: green.
 - [ ] **Step 5: Update requirements.md** rows whose evidence now exists (F5, F8–F16 consistency/correctness parts, S3 partial, Q4). Commit — `git commit -m "Add hand-derived scenario fixtures; CI: output contract and Valgrind"`
@@ -1009,9 +1031,10 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
   - `class DispatchPolicy` (pure):
     - `DispatchPolicy(Venue, const NetTuning&);`
     - `void want(std::uint16_t symbol, std::uint64_t slot_value, Clock::time_point now);`
-    - `std::optional<Dispatch> next_dispatch(Clock::time_point now);` — `Dispatch { std::uint16_t symbol; std::uint64_t slot_value; int weight; }`.
+    - `std::optional<Dispatch> next_dispatch(Clock::time_point now, std::int64_t wall_now_s);` — `Dispatch { std::uint16_t symbol; std::uint64_t slot_value; int weight; }`. `wall_now_s` places the usage header's minute boundary.
     - `Clock::time_point next_wakeup(Clock::time_point now) const;`
-    - `Outcome on_response(std::uint16_t symbol, const HttpResult&, Clock::time_point now);` — `Outcome` ∈ {`Deliver`, `Retry`, `Fatal`}.
+    - `Outcome on_response(std::uint16_t symbol, const HttpResult&, Clock::time_point now, std::int64_t wall_now_s);` — `Outcome` ∈ {`Deliver`, `Retry`, `Fatal`}.
+    - `enum class DeliveryResult { Delivered, Discard, RingFull };` and `struct ValidationResult { enum class Kind { Ok, InvalidSymbol, Unreachable } kind; std::string symbol; std::string message; };`
     - `void on_delivery(std::uint16_t symbol, DeliveryResult, Clock::time_point now);`
     - `Clock` is `std::chrono::steady_clock`. Minute rollover for the usage header uses an injected `int64 wall_now_s` argument.
   - `class RestScheduler` (Asio glue around `DispatchPolicy`):
@@ -1055,7 +1078,7 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
     - `std::uint32_t epoch() const;`
   - Read buffer: `flat_buffer`, shrunk after messages > 256 KiB; `read_message_max(1 << 20)`; idle timeout 30 s with keep-alive pings.
 
-- [ ] **Step 1: Implement.** Every handler checks `stopping_` first. Reconnects take a limiter token. A loss reported by `FrameRouter` closes the connection and reconnects at once, skipping backoff but not the limiter. Logic is tested by Task 27; there is no separate unit test here, because the class is I/O glue over pieces already tested.
+- [ ] **Step 1: Implement.** Every handler checks `stopping_` first. Any read error, close or loss calls `FrameRouter::on_disconnected()` before anything else. Reconnects take a limiter token. A loss reported by `FrameRouter` closes the connection and reconnects at once, skipping backoff but not the limiter. Logic is tested by Task 27; there is no separate unit test here, because the class is I/O glue over pieces already tested.
 - [ ] **Step 2: Build** with `-Werror` in WSL (`cmake --preset release && cmake --build build/release`). Expected: no warnings.
 - [ ] **Step 3: Commit** — `git commit -m "Add WebSocket shard with reconnect and state-aware shutdown"`
 
@@ -1086,7 +1109,16 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
     - 327 680 B × connections retained;
     - 1 MiB × connections + 4 × 1 114 112 B transient;
     - 48 MiB allowance.
-  - Startup order (§3.1): validate options → validate symbols → `prepare_output_dir` → **one** `archive_existing` call with every symbol's three names → create files → start the processor thread (`run_consumer`) → start shards.
+  - Startup order (§3.1):
+    1. validate options — including `ws_target` for every shard, so an over-long URL exits 2 before any network use;
+    2. validate symbols (REST);
+    3. `prepare_output_dir`;
+    4. **one** `archive_existing` call with every symbol's three names;
+    5. create files;
+    6. start the processor thread (`run_consumer`);
+    7. start shards.
+
+    The `--duration` deadline is measured from process start (`main` records `steady_clock::now()` first), not from step 7.
   - A `poll_interval` io timer scans `RequestSlots` and the consumer's `fatal_code`. Stats print every `stats_interval_s`.
   - The final summary prints `VmHWM`, `budget_mib`, the `epoch_closed` lines and a totals line. It checks `frames_received == md_rows + malformed_frames + ring_drops`; on a violation it logs an error, and the exit code becomes 1.
 
@@ -1118,7 +1150,13 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
   - `ReversedEnvelopeFrames`: the server sends some frames with `data` before `stream` → the same rows as the forward form, and no loss transition.
   - `UntrustedCertificateRejected`: the client is given a different test CA → the TLS handshake fails, no rows are written, and the error is logged; verification is never bypassed (Q16).
   - `WriterFailureExitsOne`: `output_factory` returns a writer that fails after 5 rows → shutdown within `poll_interval` + `shutdown_deadline`, exit 1.
-  - All timings come from a test `NetTuning`: limiter 5 attempts / 2 s, backoff 10–100 ms, shutdown deadline 1 s.
+  - All timings come from a test `NetTuning` (limiter 5 attempts / 2 s, backoff 10–100 ms, shutdown deadline 1 s), multiplied by `BLC_TEST_TIME_SCALE`. Handshake-delay tests trigger SIGINT on a server event (ClientHello received / HTTP Upgrade received), not after a sleep. Assertions are orderings and upper bounds (for example "exit within 5 s × scale"), never exact counts.
+  - `SigtermClean`: like `SigintClean`, with SIGTERM.
+  - `DurationExpiryDuringHandshakes`: `--duration` expires while the server holds the TLS and then the WebSocket handshake → exit 0, no WebSocket close attempted.
+  - `ShutdownWhileWaiting`: the server refuses connections, so the shard sits in backoff (`Waiting`); SIGINT → exit 0 promptly, no further attempts. (`Resolving`/`Connecting` complete instantly on loopback and cannot be held open reliably; their cancel path is the same `close lowest layer` call exercised by the handshake tests.)
+  - `OversizedFrameRejected`: the server sends a 1.5 MiB frame → read error, reconnect, counted; no record pushed.
+  - `OversizedRestBodyRetried`: a 1.5 MiB depth body → request fails, retried, counted; the symbol syncs once a normal body is served.
+  - The test CA issues the server certificate with `subjectAltName = IP:127.0.0.1`, so `host_name_verification("127.0.0.1")` passes.
   - `DurationBeforeSyncExitsZero` (Review Focus 5): snapshots are delayed past `--duration 1` → exit 0; header-only order-book file; summary has `syncs=0`.
 - [ ] **Step 2: Run** in WSL: `./build/debug/tests/unit_tests --gtest_filter='CaptureLoopback*'`. Then run the same under `build/asan` and `build/tsan`. Expected: PASS, no sanitizer reports.
 - [ ] **Step 3: Commit and push**; check CI is green — `git commit -m "Add loopback capture integration test"`
@@ -1147,14 +1185,14 @@ Two scenarios are deliberately not file fixtures. The reversed envelope never re
 
 **Files:** Modify `.github/workflows/ci.yml`; source fixes.
 - [ ] **Step 1:** In WSL, configure a Clang build so the compile database holds Clang flags (GCC-only warnings such as `-Wlogical-op` would make clang-tidy error): `cmake -B build/tidy -G Ninja -DCMAKE_CXX_COMPILER=clang++-15 -DCMAKE_BUILD_TYPE=Debug`. Then run `run-clang-tidy-15 -p build/tidy -header-filter='src/.*' 'src/.*'` (`third_party/` excluded) and fix the findings. Keep each suppression narrow, with a `// NOLINT(<check>): <reason>` comment.
-- [ ] **Step 2:** Add the `clang-tidy` job, which fails on any warning. Push; expect green.
+- [ ] **Step 2:** Add the `clang-tidy` job, run with `-warnings-as-errors='*'` (the repo's `.clang-tidy` keeps `WarningsAsErrors: ''` for local use), so any warning fails it. Push; expect green.
 - [ ] **Step 3:** Commit — `git commit -m "CI: clang-tidy job and fixes"`
 
 ### Task 30: `--fault-reconnect-every`, limit validation, remaining shutdown tests
 
 **Files:** Modify `src/blc/net/ws_shard.cpp`, `src/blc/cli/options.cpp`; Test: `tests/cli_options_test.cpp`, `tests/net_capture_loopback_test.cpp`
 - [ ] **Step 1: Write failing tests:**
-  - `FaultReconnectEvery`: with the loopback server, `--fault-reconnect-every 1` over 4 s produces epochs 0..3 and resyncs each time;
+  - `FaultReconnectEvery`: with the loopback server and `--fault-reconnect-every 1`, the capture runs until at least epoch 2 has synced (event-gated, upper bound 10 s × scale). Assert epochs are strictly increasing, each epoch's first row is `R`, and no row precedes its epoch's `R`;
   - option limits: `--fault-reconnect-every -1` and `--stats-interval -1` are usage errors.
 - [ ] **Step 2: Run.** FAIL. **Step 3: Implement.** **Step 4: Run.** PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Add fault-injection reconnects and limit validation"`
