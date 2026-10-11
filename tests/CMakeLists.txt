@@ -28,7 +28,8 @@ add_executable(unit_tests
     simdjson_smoke_test.cpp
     parse_envelope_test.cpp
     parse_stream_table_test.cpp
-    parse_payload_test.cpp)
+    parse_payload_test.cpp
+    book_side_test.cpp)
 target_link_libraries(unit_tests PRIVATE blc_core GTest::gtest_main)
 set(BLC_TEST_SOURCE_DIR "${PROJECT_SOURCE_DIR}")
 configure_file(support/paths.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/support/paths.hpp" @ONLY)
