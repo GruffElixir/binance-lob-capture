@@ -27,9 +27,14 @@ add_executable(unit_tests
     cli_options_test.cpp
     simdjson_smoke_test.cpp
     parse_envelope_test.cpp
-    parse_stream_table_test.cpp)
+    parse_stream_table_test.cpp
+    parse_payload_test.cpp)
 target_link_libraries(unit_tests PRIVATE blc_core GTest::gtest_main)
-target_include_directories(unit_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+set(BLC_TEST_SOURCE_DIR "${PROJECT_SOURCE_DIR}")
+configure_file(support/paths.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/support/paths.hpp" @ONLY)
+target_include_directories(unit_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
 blc_set_warnings(unit_tests)
 
 # `cmake --build build --target tests` is the documented way to build the test suite.

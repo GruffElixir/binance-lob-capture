@@ -11,6 +11,7 @@ add_library(blc_core STATIC
     blc/csv/csv_writer.cpp
     blc/parse/envelope.cpp
     blc/parse/json_workspace.cpp
+    blc/parse/payload_parser.cpp
     blc/parse/stream_table.cpp
     blc/util/logging.cpp)
 target_include_directories(blc_core PUBLIC
