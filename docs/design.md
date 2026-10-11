@@ -683,9 +683,9 @@ budget. Limits verified live on 2026-10-11 via `exchangeInfo` and `X-MBX-USED-WE
 
 - **Pacing:** a token bucket with capacity = budget, refilled at budget / 60 per second. A
   request is dispatched only when the bucket holds its weight and fewer than 4 of the 4
-  **request slots** are taken. Requests are served FIFO. A slot is taken at dispatch and released
+  **dispatch slots** are taken. Requests are served FIFO. A dispatch slot is taken at dispatch and released
   only when its response has been pushed to the ring or discarded, not when the HTTP exchange
-  completes. A completed body waiting for ring space therefore keeps its slot, so at most 4
+  completes. A completed body waiting for ring space therefore keeps its dispatch slot, so at most 4
   bodies exist at any time (in flight or waiting), and no new request starts while 4 wait.
 - **One slot per symbol, holding the latest wanted request.** The slot holds the newest
   `(epoch, request number)` seen from the processor.
@@ -848,8 +848,11 @@ Steps:
    - set `stopping`;
    - cancel timers;
    - the scheduler stops dispatching and cancels in-flight requests;
-   - every shard shuts down according to its connection state (`Resolving`, `Connecting`,
-     `TlsHandshake`, `WsHandshake`, `Open`, `Closing`, `Closed`):
+   - every shard shuts down according to its connection state (`Waiting` for backoff or a
+     limiter token, `Resolving`, `Connecting`, `TlsHandshake`, `WsHandshake`, `Open`,
+     `Closing`, `Closed`):
+     - **`Waiting`:** cancel its timer and leave the attempt limiter's queue; no attempt is
+       started;
      - **`Open`:** graceful `async_close`, with a 2 s timeout after which the TCP socket is
        closed;
      - **any earlier state:** the pending resolve, connect or handshake is cancelled by
@@ -858,8 +861,9 @@ Steps:
        handshake completes;
      - **`Closing` / `Closed`:** nothing to do;
    - every completion handler checks `stopping` first. After shutdown has begun, a handler that
-     completes (including with `operation_aborted`) never advances the state machine: no
-     handshake step, read, reconnect or record push is started;
+     completes (including with `operation_aborted`) never advances the state machine: it starts
+     no handshake step, new read or reconnect. A read that completed successfully may still push
+     its record (below), but no further read is issued;
    - a 3 s deadline timer calls `io_context::stop()` if anything hangs.
 
    A read that completes after `stopping` was set may still push its record: that data was
@@ -1015,9 +1019,9 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 |---|---|---|
 | WebSocket receive buffer, per connection (§6.2) | ≤ 256 KiB | ≤ 1 MiB while reading a message larger than 256 KiB |
 | TLS + WebSocket stream state, per connection (OpenSSL record buffers ≈ 2 × 17 KiB plus Beast state; an estimate, measured in M5) | ≈ 64 KiB | — |
-| REST request slot, at most 4 (§6.3): in flight, or a completed body waiting for ring space | 0 once delivered or discarded | ≤ 1 MiB body + ≈ 64 KiB TLS each; ≤ 4.3 MiB in total, including bodies waiting on a full ring |
+| REST dispatch slot, at most 4 (§6.3): in flight, or a completed body waiting for ring space | 0 once delivered or discarded | ≤ 1.1 MiB each (1 MiB body + ≈ 64 KiB TLS, rounded up); ≤ 4.4 MiB in total, including bodies waiting on a full ring |
 
-- **Default, up to 50 symbols** (1 connection): ≈ 0.3 MiB retained, ≤ 5.3 MiB transient.
+- **Default, up to 50 symbols** (1 connection): ≈ 0.3 MiB retained, ≤ 5.4 MiB transient (1 MiB WebSocket + 4 × 1.1 MiB REST).
 - **Worst case, 64 connections** (the process cap, §9): ≈ 20 MiB retained. Up to 64 MiB more
   is transient, and only if every connection were reading a maximum-size message at the same
   moment.
