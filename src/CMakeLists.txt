@@ -4,7 +4,8 @@ configure_file(blc/version.hpp.in "${CMAKE_BINARY_DIR}/generated/blc/version.hpp
 # implementation. Networking (Boost.Beast, OpenSSL) lives in blc_net.
 add_library(blc_core STATIC
     blc/core/decimal.cpp
-    blc/core/time.cpp)
+    blc/core/time.cpp
+    blc/csv/csv_writer.cpp)
 target_include_directories(blc_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_BINARY_DIR}/generated")

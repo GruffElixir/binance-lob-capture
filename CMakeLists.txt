@@ -34,6 +34,12 @@ option(BLC_BUILD_TESTS "Build the unit tests (target: tests)" ON)
 option(BLC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 set(BLC_SANITIZER "" CACHE STRING "Sanitizers: empty, 'address,undefined' or 'thread'")
 
+# Windows/MSYS2 development builds only: link the runtime statically so an unrelated
+# libstdc++-6.dll earlier on PATH (for example Git for Windows') is never picked up.
+if(MINGW)
+    add_link_options(-static)
+endif()
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
 include(Sanitizers)
