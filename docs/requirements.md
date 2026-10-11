@@ -1,8 +1,8 @@
 # Requirements traceability
 
 Every requirement from the assignment brief, with the evidence that proves it is met.
-`Status` moves from **Planned** → **Done** only when the evidence exists (test, CI job, or
-README section).
+`Status` moves from **Planned** → **Partial** (some of the evidence exists, named in the cell)
+→ **Done** only when all the evidence exists (test, CI job, or README section).
 
 Release gate for the `v1.0.0` tag:
 
@@ -44,18 +44,18 @@ Subscriptions per symbol (lowercase in the URL): `<symbol>@depth@100ms`, `<symbo
 | F2 | Venues `spot` and `usdm` with the base URLs above | URL-builder unit test; live run per venue | Planned |
 | F3 | Market-data CSV: one row per message applied from the socket, storing the inner `data` payload (envelope removed) | Envelope unit tests; frame-accounting invariant per (shard, epoch): `frames_received = md_rows + malformed_frames + ring_drops`, with every `conn_seq` either in the CSV or counted as a loss (design §8) | Planned |
 | F4 | File naming `market_data_<venue>_<SYMBOL>_<UTC-date>.csv`, with the order book at `market_data_<venue>_<SYMBOL>_<UTC-date>_orderbook.csv` (the brief's output listing); choice documented | `output_files` unit test; README | Planned |
-| F5 | CSV: UTF-8, RFC 4180 quoting (comma/quote/newline → quoted, `"` → `""`), exact header first | CSV writer + reader round-trip tests | Planned |
+| F5 | CSV: UTF-8, RFC 4180 quoting (comma/quote/newline → quoted, `"` → `""`), exact header first | CSV writer + reader round-trip tests | Done — `csv_writer_test`, `csv_reader_test` (round trip, adversarial fields) |
 | F6 | Column types/ranges: `recv_tnsec` in [0, 999 999 999]; `venue` ∈ {spot, usdm}; `stream_kind` ∈ {depth_diff, depth5, trade}; `shard_id` ≥ 0; `conn_epoch` +1 per reconnect; `conn_seq` monotonic within (shard_id, conn_epoch); `symbol` uppercase; `payload_json` minified one line | Unit tests per column; `blc_verify` (C++) on scenario outputs and the sample | Planned |
 | F7 | Receive-time policy chosen and documented | README "Timestamp policy" | Planned |
-| F8 | Market-data rows in processing order (the order the LOB consumer sees) | Single consumer design; replay test | Planned |
-| F9 | Order-book row after each processed event (min: every applied `depthUpdate` and `depth5`; trades optional, documented) | Processor tests; README | Planned |
-| F10 | Order-book header exactly as above; 26 data columns per row | Header constant test (`static_assert` on column count); `awk -F',' 'NR==2{print NF}'` = 26 in CI | Planned |
-| F11 | Column semantics: `seqNo` +1 per emitted row; `id` stable int32 (derivation documented); `type` single letter (mapping documented); `side` ∈ {B, S, N}; prices/sizes scaled int64, best first | Unit tests; README tables | Planned |
-| F12 | Order-book timestamp policy documented (same source as market row) | README; replay equality test | Planned |
-| F13 | Fixed price/qty scale documented, applied deterministically; no binary floating point in CSV integer columns | Decimal parser tests (exactness, overflow, rejection) | Planned |
-| F14 | Reconnect/gap behaviour documented: `conn_epoch` and `U`/`u`/`pu` effects (reset/resync/drop) | Book state-machine tests; README | Planned |
-| F15 | Diff semantics: absolute quantities, qty 0 removes level; top-5 correct | Book unit tests; exchange-simulator property test (rows equal the true top 5, including snapshot-coverage limits); hand-derived scenario fixtures; live depth5 cross-check metric | Planned |
-| F16 | Output reproducible from fixed input | Replay determinism test: live output == replay output byte-for-byte (consistency); scenario fixtures with hand-derived expected output (correctness) | Planned |
+| F8 | Market-data rows in processing order (the order the LOB consumer sees) | Single consumer design; replay test | Done — single consumer (§6.1); `Processor.SidecarApplyBeforeRow`, `Replay.LossIntegrationReplaysIdentically` |
+| F9 | Order-book row after each processed event (min: every applied `depthUpdate` and `depth5`; trades optional, documented) | Processor tests; README | Partial — `Processor.*`, scenario fixtures; README pending |
+| F10 | Order-book header exactly as above; 26 data columns per row | Header constant test (`static_assert` on column count); `awk -F',' 'NR==2{print NF}'` = 26 in CI | Done — `CsvSchema` tests + `static_assert`; `scripts/verify_outputs.sh` (26 columns) in the `output-contract` job |
+| F11 | Column semantics: `seqNo` +1 per emitted row; `id` stable int32 (derivation documented); `type` single letter (mapping documented); `side` ∈ {B, S, N}; prices/sizes scaled int64, best first | Unit tests; README tables | Partial — `Processor.BookRowFormat`, `Processor.SeqNoPerSymbol`, `blc_verify`; README tables pending |
+| F12 | Order-book timestamp policy documented (same source as market row) | README; replay equality test | Partial — `R` row timestamps pinned by `sync_by_later_diff`; README pending |
+| F13 | Fixed price/qty scale documented, applied deterministically; no binary floating point in CSV integer columns | Decimal parser tests (exactness, overflow, rejection) | Done — `core_decimal_test` (exactness, overflow, rejection); design §4.2 |
+| F14 | Reconnect/gap behaviour documented: `conn_epoch` and `U`/`u`/`pu` effects (reset/resync/drop) | Book state-machine tests; README | Partial — `book_sync_test`, `gap_resync` and `two_symbols_one_shard_reconnect` scenarios, `LossIntegration`; README pending |
+| F15 | Diff semantics: absolute quantities, qty 0 removes level; top-5 correct | Book unit tests; exchange-simulator property test (rows equal the true top 5, including snapshot-coverage limits); hand-derived scenario fixtures; live depth5 cross-check metric | Partial — book tests, property test, 10 hand-derived scenarios; live depth5 metric pending (M5) |
+| F16 | Output reproducible from fixed input | Replay determinism test: live output == replay output byte-for-byte (consistency); scenario fixtures with hand-derived expected output (correctness) | Partial — scenario fixtures (correctness) and loss-scenario replay equality; live capture == replay pending (M5) |
 
 ## Submission
 
@@ -63,7 +63,7 @@ Subscriptions per symbol (lowercase in the URL): `<symbol>@depth@100ms`, `<symbo
 |---|---|---|---|
 | S1 | C++ only; CMake; README with compiler, standard, dependencies, full build commands, exact CLI for both CSVs, symbol-list format, scaling + timestamp policies, reconnect/gap summary, threading + I/O design note | README review checklist | Planned |
 | S2 | Short sample run (1–2 min, one symbol): `market_data_*.csv` + matching `*_orderbook.csv` (same window) | `samples/` committed with all three files of the run (market data, order book and the depth-snapshot sidecar that replay needs); README excerpt | Planned |
-| S3 | Replay mode reads `market_data_*.csv` and reproduces the order book with no network calls; stated in README | CI replays through the `market_data_*.csv` glob (order-book files skipped) and `strace` shows no `socket()` calls; README statement | Planned |
+| S3 | Replay mode reads `market_data_*.csv` and reproduces the order book with no network calls; stated in README | CI replays through the `market_data_*.csv` glob (order-book files skipped) and `strace` shows no `socket()` calls; README statement | Partial — `output-contract` job replays through the glob and asserts no `socket()` under strace; README statement pending |
 | S4 | `.gitignore` excludes `build/`, `*.csv`, `*.o`, `*.a`, `*.so`, `.env`, `config/secrets.json`; no credentials in repo; config via environment variables or a `.env.example` template | `.gitignore` (in place); CI secrets grep with the pattern assembled at runtime; `.env.example` with comments only (no variables exist) | Planned |
 | S5 | Annotated tag `v1.0.0` ("Submission v1.0.0") pushed | `git tag -n` | Planned |
 | S6 | README ends with the brief's submission section, in order: "How to Submit on GitHub" (1. initialize and push, 2. `.gitignore`, 3. tag), then "Full Build & Run Commands (Reproducible)" with Prerequisites, Clone and build, Run — Live capture, Run — Verify CSV schema, Run tests (if applicable) and the Reviewer Checklist table (Ubuntu 22.04 packages; GCC 12, C++17; tested with Clang 15). **Verbatim policy:** headings and commands are kept verbatim, except for these documented adaptations: `<your-username>` → `GruffElixir`; example dates → the real sample date; the output listing adds the depth-snapshot sidecar; the package list adds `ca-certificates`; pipes inside the Reviewer Checklist table are escaped (Markdown requires it). | `scripts/check_readme.sh` (CI, M8) checks that the README ends with these headings in order and contains each brief command, allowing only the listed adaptations; CI uses the same package list | Planned |
@@ -78,7 +78,7 @@ Subscriptions per symbol (lowercase in the URL): `<symbol>@depth@100ms`, `<symbo
 | Q1 | Diff vs depth5 replace semantics; trades do not mutate a diff-based book unless documented | Book tests; README | Planned |
 | Q2 | `U`/`u`/`pu` sequencing and new-`conn_epoch` behaviour consistent with CSV output | State-machine tests; replay test across an epoch change | Planned |
 | Q3 | Determinism: integer scaling, no `double` on the path to CSV integers, stable level ordering | Code review; tests | Planned |
-| Q4 | RFC 4180 escaping of `payload_json`, no silent truncation, exact headers | CSV tests incl. adversarial payloads | Planned |
+| Q4 | RFC 4180 escaping of `payload_json`, no silent truncation, exact headers | CSV tests incl. adversarial payloads | Done — `csv_writer_test` adversarial payloads; `Verify.RejectsEachViolation`; no-truncation rule in the writer |
 | Q5 | RAII ownership; no dangling references across async callbacks; websocket + I/O teardown on SIGINT/SIGTERM without leaks; sanitizer/Valgrind clean | `capture_loopback` integration test (real `WsShard`, REST scheduler and TLS against an in-process TLS server; SIGINT, second SIGINT, `--duration`, forced reconnect) under ASan+LSan and TSan in CI; `live_smoke.sh` with an ASan build ended by SIGINT (zero LSan reports); Valgrind on replay | Planned |
 | Q6 | Reconnect paths, partial reads, parse failures are logged and counted, never UB | Metrics; fault-injection tests | Planned |
 | Q7 | Modern C++: `constexpr`, `enum class`, scoped types, no unnecessary macros, const-correct hot structures | clang-tidy CI job | Planned |

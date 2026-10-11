@@ -177,3 +177,101 @@ jobs:
           set -euo pipefail
           # See the asan-ubsan job: disabling ASLR avoids "unexpected memory mapping" aborts.
           setarch "$(uname -m)" -R ./build/tsan/tests/unit_tests
+
+  output-contract:
+    name: Output contract (scenario replays, blc_verify, no network in replay)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+      options: --cap-add=SYS_PTRACE
+    env:
+      CXX: g++-12
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y $README_APT_PACKAGES $CI_APT_PACKAGES strace
+
+      - uses: actions/checkout@v5
+
+      - name: Build (Release)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target binance_capture blc_verify
+
+      - name: Replay every scenario through the market_data_*.csv glob
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in tests/scenarios/*/; do
+            name="$(basename "$dir")"
+            ./build/binance_capture --replay "$dir"input/market_data_*.csv --output-dir "replay_output/$name"
+            diff -r "replay_output/$name" "${dir}expected"
+          done
+
+      - name: Verify inputs and outputs (headers, 26 columns, blc_verify)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in tests/scenarios/*/; do
+            name="$(basename "$dir")"
+            scripts/verify_outputs.sh "replay_output/$name"/*.csv "$dir"input/*.csv
+          done
+
+      - name: The no-socket assertion itself works
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) = 3\n' > synthetic_socket.log
+          : > synthetic_empty.log
+          if scripts/check_no_socket.sh synthetic_socket.log; then
+            echo "::error::a trace containing socket( was accepted"
+            exit 1
+          fi
+          scripts/check_no_socket.sh synthetic_empty.log
+
+      - name: Replay makes no network calls (strace)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir=tests/scenarios/two_symbols_one_shard_reconnect
+          strace -f -e trace=socket -o strace.log \
+            ./build/binance_capture --replay "$dir"/input/market_data_*.csv --output-dir strace_output
+          scripts/check_no_socket.sh strace.log
+
+      - name: Credential-like text only where documented
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          scripts/check_secrets.sh
+
+  valgrind:
+    name: Valgrind (scenario replays)
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      CXX: g++-12
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y $README_APT_PACKAGES $CI_APT_PACKAGES valgrind
+
+      - uses: actions/checkout@v5
+
+      - name: Build (RelWithDebInfo)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          cmake --build build --target binance_capture
+
+      - name: Replay every scenario under Valgrind
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in tests/scenarios/*/; do
+            name="$(basename "$dir")"
+            valgrind --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect \
+              ./build/binance_capture --replay "$dir"input/market_data_*.csv --output-dir "vg_output/$name"
+            diff -r "vg_output/$name" "${dir}expected"
+          done

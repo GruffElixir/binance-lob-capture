@@ -44,6 +44,7 @@ add_executable(unit_tests
     pipeline_allocation_test.cpp
     pipeline_consumer_test.cpp
     replay_test.cpp
+    scenarios_test.cpp
     support/counting_allocator.cpp
     support/exchange_sim.cpp
     support/loss_scenario.cpp

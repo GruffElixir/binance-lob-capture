@@ -1,0 +1,4 @@
+recv_tsec,recv_tnsec,venue,stream_kind,shard_id,conn_epoch,conn_seq,symbol,payload_json
+1791669450,1000000,spot,depth_diff,0,0,1,ETHUSDT,"{""e"":""depthUpdate"",""E"":1791669450000,""s"":""ETHUSDT"",""U"":201,""u"":201,""b"":[],""a"":[[""21.00000000"",""3.00000000""]]}"
+1791669450,5000000,spot,trade,0,0,3,ETHUSDT,"{""e"":""trade"",""E"":1791669450000,""s"":""ETHUSDT"",""t"":2,""p"":""10.00000000"",""q"":""1.00000000"",""T"":1791669450000,""m"":false,""M"":true}"
+1791669450,7000000,spot,depth_diff,0,1,1,ETHUSDT,"{""e"":""depthUpdate"",""E"":1791669450000,""s"":""ETHUSDT"",""U"":601,""u"":601,""b"":[],""a"":[[""22.00000000"",""0.00000000""]]}"
