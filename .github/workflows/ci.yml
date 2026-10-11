@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      live_probe:
+        description: Probe Binance regional availability from this runner
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -138,7 +143,7 @@ jobs:
       - name: Configure and build
         run: |
           cmake --preset asan
-          cmake --build build/asan --target unit_tests
+          cmake --build build/asan --target unit_tests binance_capture
 
       - name: Unit tests
         shell: bash
@@ -147,6 +152,8 @@ jobs:
           # Runner kernels with high vm.mmap_rnd_bits can make older sanitizer runtimes abort
           # with "unexpected memory mapping"; disabling ASLR for the test process avoids it.
           setarch "$(uname -m)" -R ./build/asan/tests/unit_tests
+          setarch "$(uname -m)" -R ./build/asan/binance_capture --replay samples/market_data_*.csv --output-dir asan_sample
+          cmp samples/*_orderbook.csv asan_sample/*_orderbook.csv
 
   tsan:
     name: TSan (RelWithDebInfo)
@@ -246,6 +253,17 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           scripts/check_credentials.sh
 
+      - name: README appendix and example template
+        run: scripts/check_readme.sh
+
+      - name: Real sample replays identically
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./build/binance_capture --replay samples/market_data_*.csv --output-dir sample_replay
+          ./build/blc_verify samples/*.csv sample_replay/*.csv
+          cmp samples/*_orderbook.csv sample_replay/*_orderbook.csv
+
   valgrind:
     name: Valgrind (scenario replays)
     runs-on: ubuntu-latest
@@ -274,4 +292,33 @@ jobs:
             valgrind --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect \
               ./build/binance_capture --replay "$dir"input/market_data_*.csv --output-dir "vg_output/$name"
             diff -r "vg_output/$name" "${dir}expected"
+          done
+
+  clang-tidy:
+    name: clang-tidy / Clang 15
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y $README_APT_PACKAGES $CI_APT_PACKAGES clang-15 clang-tidy-15
+      - uses: actions/checkout@v5
+      - name: Configure Clang compile database
+        run: cmake -B build/tidy -G Ninja -DCMAKE_CXX_COMPILER=clang++-15 -DCMAKE_BUILD_TYPE=Debug
+      - name: Check application sources and headers
+        run: scripts/check_tidy.sh
+
+  live-availability:
+    if: github.event_name == 'workflow_dispatch' && inputs.live_probe
+    name: Optional live availability probe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe public endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          for url in 'https://api.binance.com/api/v3/time' 'https://fapi.binance.com/fapi/v1/time'; do
+            printf '%s HTTP ' "$url"
+            curl --connect-timeout 10 --max-time 20 -sS -o /dev/null -w '%{http_code}\n' "$url"
           done

@@ -1,0 +1,80 @@
+How to Submit on GitHub
+1. Initialize and push your repository
+# From your project root
+git init
+git add .
+git commit -m "Initial submission: Binance WebSocket capture + LOB"
+# Create a new repo on GitHub (via web UI or CLI), then:
+git remote add origin https://github.com/GruffElixir/binance-lob-capture.git
+git branch -M main
+git push -u origin main
+2. Make sure .gitignore excludes build artifacts and secrets
+# .gitignore
+build/
+*.csv
+*.o
+*.a
+*.so
+.env
+config/secrets.json
+Never commit API keys, private keys, or credentials. All config should use environment variables or a .env.example
+template (no real values).
+3. Tag your submission
+git tag -a v1.0.0 -m "Submission v1.0.0"
+git push origin v1.0.0
+Full Build & Run Commands (Reproducible)
+Prerequisites
+# Ubuntu 22.04 / Debian — install all dependencies
+sudo apt-get update
+sudo apt-get install -y \
+  cmake ninja-build \
+  g++-12 \
+  libssl-dev \
+  libboost-all-dev \
+  zlib1g-dev \
+  ca-certificates
+Compiler: GCC 12 (g++-12), Standard: C++17. Also tested with Clang 15.
+Clone and build
+git clone https://github.com/GruffElixir/binance-lob-capture.git
+cd binance-lob-capture
+cmake -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_COMPILER=g++-12 \
+  -DCMAKE_CXX_FLAGS="-Wall -Wextra -O2"
+cmake --build build --parallel
+Run — Live capture (both CSVs)
+# Single symbol, spot venue, 2-minute capture
+./build/binance_capture \
+  --venue spot \
+  --symbols BTCUSDT \
+  --output-dir ./output
+# Multi-symbol
+./build/binance_capture \
+  --venue spot \
+  --symbols BTCUSDT,ETHUSDT \
+  --output-dir ./output
+# USD-M futures
+./build/binance_capture \
+  --venue usdm \
+  --symbols BTCUSDT \
+  --output-dir ./output
+Outputs written to ./output/:
+output/
+  market_data_spot_BTCUSDT_2026-10-11.csv
+  market_data_spot_BTCUSDT_2026-10-11_orderbook.csv
+  depth_snapshots_spot_BTCUSDT_2026-10-11.csv
+Run — Verify CSV schema
+# Check header and row count
+head -2 ./output/market_data_spot_BTCUSDT_2026-10-11.csv
+head -2 ./output/market_data_spot_BTCUSDT_2026-10-11_orderbook.csv
+# Confirm orderbook has exactly 26 data columns (25 commas per data row)
+awk -F',' 'NR==2{print NF}' ./output/market_data_spot_BTCUSDT_2026-10-11_orderbook.csv
+# Expected output: 26
+Run tests (if applicable)
+cmake --build build --target tests
+./build/tests/unit_tests
+Reviewer Checklist
+cmake -B build && cmake --build build
+./build/binance_capture --venue spot --symbols BTCUSDT --duration 300
+awk -F',' 'NR==2{print NF}' *_orderbook.csv
+git grep -i "api_key\|secret\|password"
