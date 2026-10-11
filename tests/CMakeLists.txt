@@ -47,6 +47,8 @@ add_executable(unit_tests
     scenarios_test.cpp
     net_endpoints_test.cpp
     net_attempt_limiter_test.cpp
+    net_dispatch_policy_test.cpp
+    net_rest_scheduler_test.cpp
     support/counting_allocator.cpp
     support/exchange_sim.cpp
     support/loss_scenario.cpp

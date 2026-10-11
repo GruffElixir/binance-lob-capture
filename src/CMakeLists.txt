@@ -47,7 +47,11 @@ find_package(OpenSSL REQUIRED)
 
 add_library(blc_net STATIC
     blc/net/attempt_limiter.cpp
-    blc/net/endpoints.cpp)
+    blc/net/dispatch_policy.cpp
+    blc/net/endpoints.cpp
+    blc/net/rest_scheduler.cpp
+    blc/net/rest_transport.cpp
+    blc/net/tls.cpp)
 target_link_libraries(blc_net PUBLIC blc_core Boost::headers OpenSSL::SSL OpenSSL::Crypto
     Threads::Threads)
 target_compile_definitions(blc_net PUBLIC BOOST_ASIO_NO_DEPRECATED)
