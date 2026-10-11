@@ -9,6 +9,9 @@ add_library(blc_core STATIC
     blc/core/time.cpp
     blc/csv/csv_reader.cpp
     blc/csv/csv_writer.cpp
+    blc/parse/envelope.cpp
+    blc/parse/json_workspace.cpp
+    blc/parse/stream_table.cpp
     blc/util/logging.cpp)
 target_include_directories(blc_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
