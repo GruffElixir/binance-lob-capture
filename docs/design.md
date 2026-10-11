@@ -391,8 +391,9 @@ updates applied to a synchronised book; the bootstrap batch is represented by it
 
 ### 5.5 Background coverage refresh (enhancement)
 
-Implemented after the mandatory behaviour (§5.3 exhaustion → resync) is complete and tested. It
-renews coverage without interrupting output.
+Built in the optional milestone M7, after the mandatory behaviour (§5.3 exhaustion → resync) is
+complete and tested. It renews coverage without interrupting output. Without it, correctness is
+unchanged; only short output pauses during resyncs remain.
 
 - **Trigger:** Synced, either coverage margin below 200, and no refresh in progress → request a
   snapshot.
@@ -472,7 +473,8 @@ All state below is per symbol. No event for one symbol changes another symbol's 
 | depth5 mismatch | Unsynced and resync (§5.6) |
 | Snapshot too old or not authoritative | Discarded; a new one is requested (§5.4) |
 | REST request failure | Retried by the scheduler (§6.3) |
-| Envelope invalid, stream not subscribed, or ring full | Counted; no market-data row; its `conn_seq` number stays unused |
+| Frame lost before the processor (ring full, or invalid envelope) | Shard loss transition (§6.2): the rest of the connection is withheld and the shard reconnects. Each of its symbols resets at its first record of the new epoch, so no row is ever built on a book that missed a frame |
+| Valid envelope for an unsubscribed stream | Counted only; no market-data row; its `conn_seq` number stays unused |
 
 Epochs are tracked per symbol, not per shard. A symbol has no market-data records between a
 disconnect and its own first record on the new connection, so resetting at that record discards
@@ -549,11 +551,38 @@ consumer is idle.
   connect → TLS handshake → WebSocket handshake → read loop.
 - **TLS:** `ssl::context::tls_client`, TLS ≥ 1.2, system CA store (`set_default_verify_paths`),
   `verify_peer`, `ssl::host_name_verification`, SNI. Verification is never disabled.
-- **WebSocket:** `read_message_max` 4 MiB; 10 s handshake timeout; 30 s idle timeout with
+- **WebSocket:** `read_message_max` 1 MiB, above the largest diff the decoder accepts
+  (20 000 levels ≈ 600 KB of JSON, §6.5); 10 s handshake timeout; 30 s idle timeout with
   keep-alive pings. Beast answers server pings (spot every 20 s, usdm every 3 min) automatically
   and reassembles fragmented messages, so the processor only ever sees whole messages.
-- **Per frame:** take `recv_ns` and the next `conn_seq`; split the envelope; look up the stream
-  name → (symbol index, stream kind) in the shard's table; push the record to the ring.
+- **Receive buffer:** one Beast `flat_buffer` per connection, reused across reads. `consume()`
+  keeps the allocated capacity, so after a message larger than 256 KiB is consumed the buffer
+  is shrunk (`shrink_to_fit`). Retained capacity therefore stays ≤ 256 KiB per connection
+  (§9).
+- **Per frame:** the socket-independent `FrameRouter` (one per shard, in `blc_core`) takes
+  `recv_ns` and the next `conn_seq`, splits the envelope, looks up the stream name → (symbol
+  index, stream kind) in the shard's table, and pushes the record to the ring. `WsShard` only
+  feeds it whole messages, so the routing and loss logic is unit-testable without a network.
+- **Loss transition.** A frame that never reaches the processor may be a diff. Later records of
+  the same symbols would then be processed against a book that silently missed it: a trade or
+  depth5 arriving before the next diff would emit a row from a stale book while the symbol still
+  looks Synced. Two kinds of loss start the transition:
+  - the ring is full (§6.4);
+  - the envelope is invalid, so the frame's symbol is unknown.
+
+  On either, the shard immediately becomes **lost**:
+  - every further frame of the current connection is discarded without being pushed (each
+    consumes its `conn_seq` and is counted in `ring_drops` as withheld), so no record received
+    after the loss reaches the processor;
+  - the connection is closed and reconnected at once (the first attempt skips the backoff);
+  - snapshot responses for the shard's symbols are held, not delivered (§6.3);
+  - the next connection's records carry a new `conn_epoch`, so each symbol resets at its first
+    record after the loss (§5.7) and resynchronises.
+
+  This needs no extra CSV column and replays exactly. The market-data CSV holds exactly the
+  records that were delivered, and the epoch change it shows triggers the same resets in replay.
+  A frame with a valid envelope for an unsubscribed stream cannot belong to a subscribed symbol;
+  it is only counted.
 - **Envelope split, fast path:** a validated byte scan, not a JSON parse. The frame must start
   with `{"stream":"`, the name ends at the next `"`, which must be followed by `,"data":`; the
   payload runs from there to the final `}` and must itself start with `{` and end with `}`.
@@ -587,11 +616,19 @@ budget. Limits verified live on 2026-10-11 via `exchangeInfo` and `X-MBX-USED-WE
 - **429 / 418:** a global cooldown pauses all dispatch for `Retry-After` seconds (60 s if
   absent); the failed request is requeued at the head. 418 (IP ban) is also logged as an error.
   No request is sent during a cooldown.
-- **Transport errors and timeouts** (10 s per request; body ≤ 2 MiB): requeued with per-request
+- **Transport errors and timeouts** (10 s per request; body ≤ 1 MiB): requeued with per-request
   backoff (500 ms → 30 s), still subject to the bucket and any cooldown.
-- **Delivery:** a `200` response is pushed to the ring as a snapshot record, stamped with the
-  symbol's shard and current `conn_epoch`. If the ring is full, the push is retried on a 10 ms
-  timer.
+- **Delivery:** a `200` response is delivered only while the symbol's shard has an established
+  connection with no loss since it was established. It is pushed to the ring as a snapshot
+  record, stamped with the shard and that connection's `conn_epoch`.
+  - **Shard reconnecting or lost:** the response is held instead, at most one per symbol (a
+    newer one replaces it). It is pushed once the next connection is established, stamped with
+    the new epoch.
+  - **Ring full:** the push is retried on a 10 ms timer. Each retry re-checks the shard's state,
+    so a loss in the meantime turns the retry into a hold.
+  - **Why hold:** a snapshot delivered between a loss or disconnect and the next connection
+    could complete a sync from diffs received before the loss, and emit an `R` row describing
+    an outdated book at a later time.
 - **Burst cost:** one symbol synchronises immediately. At the 256-symbol limit, initial spot
   synchronisation needs 12 800 weight, so the last symbols synchronise after about 4 minutes;
   usdm needs 5 120 weight, also about 4 minutes. The sliding window (§5.4) bounds the memory of
@@ -614,10 +651,10 @@ budget. Limits verified live on 2026-10-11 via `exchangeInfo` and `X-MBX-USED-WE
   periodic flushes and stats still run). The producer notifies only when the consumer is parked,
   so the busy path never takes a lock.
 - **Full ring:** the producer drops the newest frame and counts `ring_drops`; it never blocks the
-  io thread. The drop is visible as a `conn_seq` gap in the market-data CSV. A dropped diff
-  produces a sequence gap, which the book handles by resyncing (§5.7). At the measured BTCUSDT
-  rate (spot ≈ 7 KiB/s, usdm ≈ 15 KiB/s) a single-symbol ring covers about 18 minutes of
-  processor stall.
+  io thread. The drop starts the shard's loss transition (§6.2). In the market-data CSV it is
+  visible as a `conn_seq` gap followed by a new `conn_epoch`. At the measured BTCUSDT rate
+  (spot ≈ 7 KiB/s, usdm ≈ 15 KiB/s) a single-symbol ring covers about 18 minutes of processor
+  stall.
 - **Why a custom ring:** variable-length records are packed back to back, so memory is used in
   proportion to actual payload sizes. Each payload is contiguous and padded, so it can be parsed
   in place. A proven alternative — `boost::lockfree::spsc_queue` of slot indices plus a
@@ -775,7 +812,8 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 
 - **io-thread counters** (relaxed atomics):
   - `frames_received` and bytes per stream kind, `malformed_frames` (invalid envelope or
-    unsubscribed stream), `ring_drops`;
+    unsubscribed stream), `ring_drops` (dropped on a full ring or withheld after a loss),
+    `shard_losses`, `snapshots_held`;
   - `connects`, `reconnects`, `connect_failures`;
   - `rest_requests`, `rest_failures`, `rest_cooldowns`, `rest_weight_used`.
 - **Processor counters:**
@@ -812,21 +850,21 @@ consistent, not that the book is correct. Correctness evidence comes from indepe
 | Symbols per process | 256 | Usage error |
 | Streams per connection | 1 024 on both venues (341 symbols) — §15 | Usage error |
 | Stream URL length | 8 192 bytes (often the binding limit: ≈ 94 bytes per 20-character symbol) | Usage error |
-| WebSocket message | 4 MiB | Frame rejected (Beast error) → reconnect, counted |
-| REST body | 2 MiB (a `limit=1000` snapshot is ≈ 64 KB spot, ≈ 42 KB usdm) | Request failed → retry, counted |
+| WebSocket message | 1 MiB | Frame rejected (Beast error) → reconnect, counted |
+| REST body | 1 MiB (a `limit=1000` snapshot is ≈ 64 KB spot, ≈ 42 KB usdm) | Request failed → retry, counted |
 | Decoded diff | 20 000 levels | Rejected, handled as a gap (§6.5) |
 | Decoded REST snapshot | 1 000 levels per side | Rejected, re-requested (§6.5) |
 | Recent-diff window | 20 000 levels / 2 000 diffs per symbol | Oldest dropped, counted |
 | Book side | 5 000 levels | Trimmed to 4 000, coverage adjusted |
 | Concurrent REST requests | 4, plus weight pacing (§6.3) | Queued |
 
-**Memory budget.** Every container below is reserved at startup and never grows (§10), so these
-figures are both the steady state and the maximum.
+**Processor and ring storage.** Every container below is reserved at startup and never grows
+(§10), so these figures are both the steady state and the maximum.
 
 | Item | Size | Scope |
 |---|---|---|
 | Ring (§6.4) | 16 / 32 / 64 MiB by symbol count | Fixed |
-| simdjson parser (capacity 4 MiB, ≈ 5× capacity) | ≈ 20 MiB | Fixed |
+| simdjson parser (capacity 1 MiB, ≈ 5× capacity) | ≈ 5 MiB | Fixed |
 | Decode scratch (20 000 diff levels + 2 000 snapshot levels, 16 B each) | ≈ 344 KiB | Fixed |
 | Writer buffers (2 × 64 KiB) | 128 KiB | Per symbol |
 | Books: live + refresh shadow, each 2 sides × 5 001 levels × 16 B | ≈ 313 KiB | Per symbol |
@@ -834,12 +872,39 @@ figures are both the steady state and the maximum.
 | Pending snapshot (2 × 1 000 levels × 16 B) | ≈ 31 KiB | Per symbol |
 
 - **Per symbol:** ≈ 0.85 MiB.
-- **One symbol:** ≈ 16 + 20 + 0.3 + 0.85 ≈ 37 MiB.
-- **256 symbols:** ≈ 64 + 20 + 0.3 + 216 ≈ 300 MiB.
+- **One symbol:** ≈ 16 + 5 + 0.3 + 0.85 ≈ 22 MiB.
+- **256 symbols:** ≈ 64 + 5 + 0.3 + 216 ≈ 285 MiB.
 
-The operating system commits pages only when they are touched, so a quiet symbol's resident
-memory stays below its reservation. The `retained_bytes` gauge and the peak-RSS figure in the
-final summary check these numbers in the live smoke test.
+**Network storage** (io thread). Connections = ⌈symbols ÷ `--symbols-per-connection`⌉.
+
+| Item | Retained | Transient |
+|---|---|---|
+| WebSocket receive buffer, per connection (§6.2) | ≤ 256 KiB | ≤ 1 MiB while reading a message larger than 256 KiB |
+| TLS + WebSocket stream state, per connection (OpenSSL record buffers ≈ 2 × 17 KiB plus Beast state; an estimate, measured in M5) | ≈ 64 KiB | — |
+| REST session, at most 4 concurrent (§6.3) | 0 after completion | ≈ 1 MiB body + ≈ 64 KiB TLS each |
+
+- **Default, up to 50 symbols** (1 connection): ≈ 0.3 MiB retained, ≤ 5.3 MiB transient.
+- **Worst case, 256 connections** (`--symbols-per-connection 1`): ≈ 80 MiB retained. Up to
+  256 MiB more is transient, and only if every connection were reading a maximum-size message
+  at the same moment.
+
+**RSS acceptance.**
+
+- At startup the process computes `budget_mib` as the sum of:
+  - processor and ring storage;
+  - network retained storage;
+  - worst-case network transient storage (1 MiB × connections + 4 × 1.1 MiB);
+  - a 48 MiB allowance for code, shared libraries, allocator overhead and OpenSSL globals.
+- `budget_mib` is logged at startup and printed in the final summary next to peak RSS
+  (`VmHWM`).
+- **Acceptance:** `VmHWM ≤ budget_mib`. `live_smoke.sh` (M5) and the long runs in M6 fail
+  otherwise.
+- **Example budgets:** ≈ 22 + 0.3 + 5.4 + 48 ≈ 76 MiB for one symbol;
+  ≈ 285 + 80 + 260 + 48 ≈ 673 MiB for 256 symbols on 256 connections.
+- The operating system commits pages only when they are touched, so a quiet symbol's resident
+  memory stays below its reservation.
+- The `retained_bytes` gauge reports processor and ring storage plus the receive buffers'
+  capacities.
 
 **Security:**
 
@@ -867,8 +932,9 @@ final summary check these numbers in the live smoke test.
     This holds because every processor and per-symbol container is reserved to its cap at
     startup (§9), and the decode limits (§6.5) keep every event within those caps.
   - **Not covered:**
-    - the network path: our buffers there (Beast `flat_buffer`, ring) are reused, but Asio,
-      Beast and OpenSSL may allocate internally;
+    - the network path. The ring is reused; the Beast `flat_buffer` is reused but shrunk after
+      a message over 256 KiB, which reallocates (§6.2); and Asio, Beast and OpenSSL may
+      allocate internally;
     - log lines: these are only formatted on the rate-limited warning/error path;
     - startup, archive moves, file creation and shutdown;
     - replay's CSV reader, whose row buffer grows to the longest row read.
@@ -880,14 +946,15 @@ final summary check these numbers in the live smoke test.
     asserts the count stays 0.
 - **Benchmarks** (`bench/`, off by default, plain `std::chrono` harness with repetitions and
   percentiles):
-  - decimal parsing;
-  - payload parsing per stream kind;
-  - book updates, flat vector vs `std::map`, with near-touch updates, deep updates, near-touch
-    deletions and deep deletions;
-  - ring push/pop;
-  - end-to-end replay throughput (records/s) and per-record latency p50/p99/p99.9.
+  - **Mandatory (M6), because it backs Q11:** book updates, flat vector vs `std::map`, with
+    near-touch updates, deep updates, near-touch deletions and deep deletions.
+  - **Optional (M7, stretch X3):**
+    - decimal parsing;
+    - payload parsing per stream kind;
+    - ring push/pop;
+    - end-to-end replay throughput (records/s) and per-record latency p50/p99/p99.9.
 
-  Results, with the machine description, go into the README (X3).
+  Results, with the machine description, go into the README.
 - Release builds use `-O3` (CMake's Release default) on top of the documented
   `-Wall -Wextra -O2` flags; no `-march=native`, so binaries stay portable.
 
@@ -905,7 +972,8 @@ src/
     book/                  book_side.hpp, order_book.{hpp,cpp} (incl. coverage),
                            sequence.{hpp,cpp}, diff_window.{hpp,cpp}, sync.{hpp,cpp},
                            depth5_check.{hpp,cpp}
-    pipeline/              record.hpp, spsc_ring.hpp, processor.{hpp,cpp},
+    pipeline/              record.hpp, spsc_ring.hpp, frame_router.{hpp,cpp} (per-shard frame
+                           handling and loss state, no Boost), processor.{hpp,cpp},
                            output_files.{hpp,cpp}, snapshot_requester.hpp, metrics.{hpp,cpp}
     replay/                replay_source.{hpp,cpp}
     net/                   endpoints.{hpp,cpp}, tls.{hpp,cpp}, ws_shard.{hpp,cpp},
@@ -997,6 +1065,8 @@ results derived independently of the code under test.
 | `processor` | Row emission rules (§5.8), `type`/`side` mapping, `--no-trade-rows`, sidecar `apply_before_row`, per-symbol epoch isolation |
 | `output_files` | Naming; archiving a symbol's existing files as one set into `replaced_<…>/`, including when only some exist; directory-name collisions; replay-output archiving |
 | `spsc_ring` | Every wrap case, padding, full-ring drop, close protocol, randomised length fuzz, two-thread stress (run under TSan) |
+| `frame_router` | `conn_seq` assignment, envelope routing, unsubscribed stream (counted only); on a full ring or invalid envelope: shard becomes lost, later frames of the connection withheld (`conn_seq` consumed, counted), reconnect requested; snapshot responses held while lost or reconnecting and delivered with the new epoch |
+| **`loss` integration** (no network) | The supervisor's scenario, end to end: frames go through `FrameRouter` into a deliberately tiny ring and the processor. A diff that deletes the best bid is dropped on a full ring, then a trade arrives before the next diff. Expected: the trade is never delivered; no order-book row shows the stale best bid; the simulated reconnect starts a new epoch; the symbol resyncs. The resulting CSVs replay to identical output |
 | `shutdown` | Close with an empty ring, a full ring, a second signal, and a writer failure: the consumer always terminates and drains |
 | `allocations` | Zero heap allocations on the covered path (§10) |
 | **Exchange simulator** (property test) | A reference "exchange" holds a full-depth book and generates random activity: diffs, depth5, trades, REST snapshots truncated to 1 000 levels, reconnects. The output is fed through the processor. Every emitted row must equal the simulator's true top 5 at that point, and output may be suppressed only when the rules require it. 10⁵+ steps across seeds, both venues |
@@ -1020,7 +1090,7 @@ TDD applies: each module's tests are written before its implementation.
 | REST usage | Weighted token bucket at 50 % of the IP budget, header reconciliation, global cooldown | Concurrency limits alone exceed the budget at scale; per-request `Retry-After` lets other requests continue during a cooldown |
 | Threading | io thread + processor over an SPSC ring | One thread lets disk stalls block the socket; a writer thread adds a hop with no measured benefit |
 | Queue | Custom byte ring, built first under heavy tests | `spsc_queue` + fixed-size pool also caps memory, but either wastes most of each slot or splits payloads, which then need copying before parsing (kept as fallback) |
-| Ring full | Drop newest, counted, visible as `conn_seq` gap | Blocking stalls every connection and their pings, and loses more data through disconnects |
+| Ring full | Drop newest, then shard loss transition (withhold the rest of the connection, reconnect, per-symbol reset on the new epoch) | Blocking stalls every connection and their pings. Relying on the next diff's sequence check lets trades and depth5 emit rows from a book that missed the dropped diff. A persisted loss marker would need a CSV column the fixed schema doesn't have |
 | Book structure | Sorted flat vector, best at back, galloping search | `std::map` allocates per insert and chases pointers; a price-indexed ladder needs tick sizes and wide ranges |
 | JSON | simdjson On-Demand (vendored) | Boost.JSON requires Boost 1.75 (jammy has 1.74); RapidJSON/nlohmann are slower or allocate per value |
 | WebSocket/TLS | Boost.Beast + OpenSSL | Already in the brief's package list; websocketpp is unmaintained; libwebsockets is C-callback based |
@@ -1047,9 +1117,9 @@ TDD applies: each module's tests are written before its implementation.
 
 1. **depth5 consistency (M6):** `depth5_mismatch` must be 0 over a 10-minute capture per venue
    (spot full checks, usdm partial checks). Any mismatch is investigated before submission.
-2. **Coverage (M6, then M7):** count `coverage_exhausted` over a 30-minute capture before the
-   refresh enhancement exists, then `coverage_exhausted` and `refresh_ok` after it; record both
-   in the README.
+2. **Coverage (M6, and M7 if built):** count `coverage_exhausted` over a 30-minute capture
+   without the refresh enhancement. If M7 is built, repeat with it, counting
+   `coverage_exhausted` and `refresh_ok`. Record the results in the README.
 3. **US IP block (M5):** confirm GitHub-hosted runners receive HTTP 451 from Binance; if they do
    not, a live smoke job is added to CI.
 
@@ -1064,8 +1134,13 @@ requirement row it delivers moved to **Done** in [requirements.md](requirements.
 | M1 | Core primitives: `types`, `decimal`, `time`, `instrument_id`, `symbols`, CSV schema/writer/reader, CLI options, logging. CI: clang-format, ASan + UBSan | M0 | Unit tests green under ASan + UBSan |
 | M2 | Parsing: vendored simdjson, envelope split (fast path + order-independent fallback), payload parsers with decoded-size limits, real-payload fixtures | M1 | Parser and limit tests green |
 | M3 | Order book: `book_side`, coverage, sequence classifier, recent-diff window, sync state machine, depth5 check, exchange simulator | M2 | Simulator property test and sync, coverage and depth5 suites green |
-| M4 | Pipeline + replay: SPSC ring first, alone (TSan job); then processor, output files with archive rule, sidecar, replay mode, scenario fixtures, allocation test. CI: output contract (scenario part), Valgrind | M3 | Every scenario fixture replays to its hand-derived expected output; zero allocations |
+| M4 | Pipeline + replay: SPSC ring first, alone (TSan job); then `FrameRouter` with the loss transition, processor, output files with archive rule, sidecar, replay mode, scenario fixtures, `loss` integration test, allocation test. CI: output contract (scenario part), Valgrind | M3 | Every scenario fixture replays to its hand-derived expected output; `loss` integration test green; zero allocations |
 | M5 | Networking (needs WSL): endpoints, TLS, `WsShard`, REST scheduler, capture app, signals and `--duration`, shutdown protocol, metrics and stats | M4 | `live_smoke.sh` passes for both venues (60 s), frame-accounting invariant holds |
-| M6 | Hardening: clang-tidy job, `--fault-reconnect-every`, shutdown tests, limit validation, 10-minute depth5 and 30-minute coverage runs | M5 | All CI jobs green; `depth5_mismatch=0` live |
-| M7 | Enhancement and performance: background coverage refresh (§5.5), benchmarks, README performance numbers | M6 | Refresh suite green; live 30-minute run recorded; benchmark numbers in README |
-| M8 | Submission: 1–2 minute sample captures, live = replay `cmp`, full README (including the brief's submission section), `reviewer_checklist.sh`, tag `v1.0.0`, repository made public with the user's confirmation | M7 | Every mandatory row in requirements.md is Done |
+| M6 | Hardening: clang-tidy job, `--fault-reconnect-every`, shutdown tests, limit validation, book benchmark (flat vector vs `std::map`, backs Q11), 10-minute depth5 and 30-minute coverage runs, RSS acceptance on long runs | M5 | All CI jobs green; `depth5_mismatch=0` live; `VmHWM ≤ budget_mib`; book benchmark numbers in README |
+| M7 *(optional)* | Enhancement and performance: background coverage refresh (§5.5), remaining benchmarks and performance notes (X3) | M6 | Refresh suite green; live 30-minute run recorded; benchmark numbers in README |
+| M8 | Submission: 1–2 minute sample captures, live = replay `cmp`, full README (including the brief's submission section), `reviewer_checklist.sh`, tag `v1.0.0`, repository made public with the user's confirmation | M6 (and M7 only if completed) | Every mandatory row in requirements.md is Done |
+
+**M7 is optional and never blocks submission.** M8 depends only on the mandatory chain M0–M6.
+Anything in M7 that is unfinished at submission is listed in the README as deferred, and X3 is
+then marked **Deferred** in requirements.md, which the release policy allows. M7 may also run
+after M8 and ship as a later tag.
