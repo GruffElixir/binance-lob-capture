@@ -66,7 +66,9 @@ struct Run {
 void run_into(RunStats& stats, Venue venue, std::uint32_t seed, int steps,
               ExchangeSim::Options options) {
     ExchangeSim sim(venue, seed, options);
-    SymbolBook book(venue, stats.counters);
+    // Preserve the mandatory exhaustion/resync oracle as a separate baseline. Refresh has
+    // its own independent full-book oracle and bounded-delivery test in book_refresh_test.
+    SymbolBook book(venue, stats.counters, depth5_policy(venue), false);
     std::uint32_t epoch = 0;
     struct Request {
         int deliver_at;

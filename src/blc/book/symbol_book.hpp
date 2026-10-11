@@ -70,7 +70,8 @@ public:
     enum class EpochCheck { Same, Reset, Regression };
 
     SymbolBook(Venue venue, SymbolCounters& counters);
-    SymbolBook(Venue venue, SymbolCounters& counters, Depth5Policy policy);
+    SymbolBook(Venue venue, SymbolCounters& counters, Depth5Policy policy,
+               bool refresh_enabled = true);
 
     // Tracks the record's connection epoch. Reset: the first record, or a newer epoch; the caller
     // then runs enter_unsynced(NewEpoch). Regression: counted; the caller skips the record.
@@ -83,7 +84,9 @@ public:
     Emit on_snapshot(const DepthSnapshot& snapshot) noexcept;
     Emit on_snapshot_error(bool oversized) noexcept;
 
-    bool snapshot_wanted() const noexcept { return needs_snapshot_ && !outstanding_; }
+    bool snapshot_wanted() const noexcept {
+        return needs_snapshot_ && !outstanding_ && !has_pending_snapshot_;
+    }
     void mark_requested() noexcept { outstanding_ = true; }
 
     void enter_unsynced(UnsyncCause cause) noexcept;
@@ -93,13 +96,14 @@ public:
     const DiffWindow& window() const noexcept { return window_; }
     // Capacity of everything this symbol keeps between records.
     std::size_t retained_bytes() const noexcept {
-        return book_.retained_bytes() + window_.retained_bytes() +
+        return book_.retained_bytes() + shadow_.retained_bytes() + window_.retained_bytes() +
                (pending_snapshot_.bids.capacity() + pending_snapshot_.asks.capacity()) *
                    sizeof(Level);
     }
 
 private:
     Emit try_sync() noexcept;
+    void consider_refresh() noexcept;
     void append_to_window(const DepthDiff& diff) noexcept;
     // Runs a check; returns false on a mismatch that must resync.
     bool full_check_now(const Depth5& d5) noexcept;
@@ -112,6 +116,7 @@ private:
     Depth5Policy policy_;
     SyncState state_ = SyncState::Unsynced;
     OrderBook book_;
+    OrderBook shadow_;
     DiffWindow window_;
     std::uint64_t window_trimmed_seen_ = 0;
     DepthSnapshot pending_snapshot_;
@@ -121,6 +126,7 @@ private:
     std::optional<std::uint32_t> last_epoch_;
     bool needs_snapshot_ = false;
     bool outstanding_ = false;
+    bool refresh_enabled_;
     RateLimitedLog mismatch_log_;
 };
 

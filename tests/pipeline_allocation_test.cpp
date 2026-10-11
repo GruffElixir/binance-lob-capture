@@ -165,6 +165,55 @@ struct Param {
     Venue venue;
     bool trade_rows;
 };
+void generate_refresh(Scenario& sc, Processor& reference, std::uint32_t& epoch_base) {
+    const auto epoch = ++epoch_base;
+    std::uint64_t seq = 0;
+    std::int64_t t = 1791669500'000'000'000;
+    const auto& sym = sc.symbols[0].upper;
+    auto add = [&](OwnedRecord record) {
+        reference.process(record.view());
+        sc.records.push_back(std::move(record));
+    };
+    auto snapshot = [&](std::uint64_t id, std::int64_t bid, std::int64_t ask,
+                        std::int64_t quantity = 1) {
+        auto s = PayloadParser::make_snapshot();
+        s.last_update_id = id;
+        for (std::int64_t i = 0; i < 1000; ++i) {
+            s.bids.push_back({(bid - i) * P, quantity * P});
+            s.asks.push_back({(ask + i) * P, quantity * P});
+        }
+        add(test::snapshot_record(0, epoch, t++, test::snapshot_json(sc.venue, s)));
+    };
+    auto diff = [&](std::uint64_t id, std::vector<Level> bids = {}, std::vector<Level> asks = {}) {
+        add(test::market_record(
+            StreamKind::DepthDiff, 0, epoch, seq++, t++,
+            test::diff_json(sc.venue, sym,
+                            test::make_diff(id == 101 && sc.venue == Venue::Usdm ? 100 : id, id,
+                                            id - 1, std::move(bids), std::move(asks)))));
+    };
+    auto remove = [&](std::uint64_t id, std::int64_t bid, std::int64_t ask, int count) {
+        std::vector<Level> bids, asks;
+        for (int i = 0; i < count; ++i) {
+            bids.push_back({(bid - i) * P, 0});
+            asks.push_back({(ask + i) * P, 0});
+        }
+        diff(id, std::move(bids), std::move(asks));
+    };
+    diff(101);
+    snapshot(100, 10000, 20000);
+    remove(102, 10000, 20000, 850);
+    diff(103);
+    snapshot(102, 9150, 20850);
+    remove(104, 9150, 20850, 850);
+    diff(105);
+    snapshot(104, 8300, 21700,
+             2);  // untouched-price quantity change survives USD-M's overlapping bridge
+    snapshot(108, 7500, 23000);
+    remove(106, 8301, 21700, 1000);
+    diff(107);
+    diff(108);
+    diff(109);
+}
 
 class Allocations : public ::testing::TestWithParam<Param> {};
 
@@ -190,6 +239,7 @@ TEST_P(Allocations, ProcessorPathAllocatesNothing) {
     generate_symbol0(sc, reference, ref_req, epoch_base, 12, drift, 6'000, 3);
     ExchangeSim::Options slow;  // a snapshot delayed past the window's capacity
     generate_symbol0(sc, reference, ref_req, epoch_base, 13, slow, 8'000, 3'000);
+    generate_refresh(sc, reference, epoch_base);
     generate_symbol1(sc, reference);
 
     // The scenario covers what it claims to.
@@ -198,6 +248,8 @@ TEST_P(Allocations, ProcessorPathAllocatesNothing) {
     EXPECT_GT(ref.totals.resyncs, 0u);
     EXPECT_GT(ref.totals.gaps + ref.totals.resets, 2u);
     EXPECT_GT(ref.totals.coverage_exhausted, 0u);
+    EXPECT_GT(ref.totals.refresh_ok, 0u);
+    EXPECT_GT(ref.totals.refresh_mismatch, 0u);
     EXPECT_GT(ref.totals.window_trimmed, 0u);
     EXPECT_GT(ref.totals.depth5_full_checks, 0u);
     EXPECT_GT(ref.totals.depth5_mismatch, 0u);

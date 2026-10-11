@@ -35,6 +35,7 @@ add_executable(unit_tests
     book_diff_window_test.cpp
     book_depth5_check_test.cpp
     book_sync_test.cpp
+    book_refresh_test.cpp
     book_property_test.cpp
     pipeline_spsc_ring_test.cpp
     pipeline_frame_router_test.cpp

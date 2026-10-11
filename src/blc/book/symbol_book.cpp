@@ -4,6 +4,7 @@
 #include "blc/parse/payload_parser.hpp"
 
 #include <ostream>
+#include <utility>
 
 namespace blc {
 namespace {
@@ -12,11 +13,15 @@ struct MismatchContext {
     const OrderBook* book;
     const Depth5* d5;
 };
+struct RefreshContext {
+    const OrderBook* live;
+    const OrderBook* fresh;
+};
 
 void write_levels(std::ostream& os, const char* name, const Level* levels, std::size_t n) {
     os << ' ' << name << '[';
     for (std::size_t i = 0; i < n; ++i) {
-        os << (i ? " " : "") << levels[i].price << '@' << levels[i].qty;
+        os << (i != 0u ? " " : "") << levels[i].price << '@' << levels[i].qty;
     }
     os << ']';
 }
@@ -31,17 +36,30 @@ void format_mismatch(std::ostream& os, const void* raw) {
     write_levels(os, "depth5_bids", ctx.d5->bids.data(), ctx.d5->n_bids);
     write_levels(os, "depth5_asks", ctx.d5->asks.data(), ctx.d5->n_asks);
 }
+void format_refresh(std::ostream& os, const void* raw) {
+    const auto& ctx = *static_cast<const RefreshContext*>(raw);
+    TopOfBook live, fresh;
+    ctx.live->top5(live);
+    ctx.fresh->top5(fresh);
+    os << "coverage refresh mismatch id=" << ctx.fresh->id;
+    write_levels(os, "live_bids", live.bids.data(), live.bids.size());
+    write_levels(os, "live_asks", live.asks.data(), live.asks.size());
+    write_levels(os, "fresh_bids", fresh.bids.data(), fresh.bids.size());
+    write_levels(os, "fresh_asks", fresh.asks.data(), fresh.asks.size());
+}
 
 }  // namespace
 
 SymbolBook::SymbolBook(Venue venue, SymbolCounters& counters)
     : SymbolBook(venue, counters, depth5_policy(venue)) {}
 
-SymbolBook::SymbolBook(Venue venue, SymbolCounters& counters, Depth5Policy policy)
+SymbolBook::SymbolBook(Venue venue, SymbolCounters& counters, Depth5Policy policy,
+                       bool refresh_enabled)
     : venue_(venue),
       counters_(counters),
       policy_(policy),
-      pending_snapshot_(PayloadParser::make_snapshot()) {}
+      pending_snapshot_(PayloadParser::make_snapshot()),
+      refresh_enabled_(refresh_enabled) {}
 
 SymbolBook::EpochCheck SymbolBook::observe_epoch(std::uint32_t epoch) noexcept {
     if (!last_epoch_ || epoch > *last_epoch_) {
@@ -57,6 +75,7 @@ SymbolBook::EpochCheck SymbolBook::observe_epoch(std::uint32_t epoch) noexcept {
 
 void SymbolBook::enter_unsynced(UnsyncCause cause) noexcept {
     book_.clear();
+    shadow_.clear();
     has_pending_check_ = false;
     state_ = SyncState::Unsynced;
     needs_snapshot_ = true;
@@ -129,25 +148,51 @@ Emit SymbolBook::try_sync() noexcept {
         needs_snapshot_ = true;
         return {};
     }
-    book_.load(pending_snapshot_);
+    const bool refresh = state_ == SyncState::Synced;
+    auto& target = refresh ? shadow_ : book_;
+    target.load(pending_snapshot_);
     for (std::size_t i = first; i < window_.size(); ++i) {
         const DiffView d = window_.at(i);
-        book_.apply(d.bids, d.asks);
-        book_.id = d.u;
+        target.apply(d.bids, d.asks);
+        target.id = d.u;
     }
     has_pending_snapshot_ = false;
-    if (!book_.authoritative()) {
-        book_.clear();
+    if (!target.authoritative()) {
+        target.clear();
         needs_snapshot_ = true;  // a fresh snapshot is needed
         return {};
     }
-    state_ = SyncState::Synced;
     needs_snapshot_ = false;
+    if (refresh) {
+        TopOfBook old_top, fresh_top;
+        book_.top5(old_top);
+        target.top5(fresh_top);
+        if (old_top.bids == fresh_top.bids && old_top.asks == fresh_top.asks) {
+            ++counters_.refresh_ok;
+        } else {
+            ++counters_.refresh_mismatch;
+            if (mismatch_log_.should_log()) {
+                const RefreshContext ctx{&book_, &target};
+                log_formatted(LogLevel::Warn, &format_refresh, &ctx);
+            }
+        }
+        // Both pre-reserved allocations survive the swap for the next refresh.
+        std::swap(book_, shadow_);
+        consider_refresh();
+        return Emit{true, 'R', 'N'};
+    }
+    state_ = SyncState::Synced;
     ++counters_.syncs;
     if (counters_.syncs > 1) {
         ++counters_.resyncs;
     }
+    consider_refresh();
     return Emit{true, 'R', 'N'};
+}
+void SymbolBook::consider_refresh() noexcept {
+    if (refresh_enabled_ && state_ == SyncState::Synced && !has_pending_snapshot_ &&
+        (book_.margin(Side::Bid) < 200 || book_.margin(Side::Ask) < 200))
+        needs_snapshot_ = true;
 }
 
 bool SymbolBook::handle_result(CheckResult result, const Depth5& d5) noexcept {
@@ -237,7 +282,7 @@ Emit SymbolBook::on_diff(const DepthDiff& diff) noexcept {
 
     if (!book_.authoritative()) {
         enter_unsynced(UnsyncCause::CoverageExhausted);  // also drops the pending check
-        return {};
+        return try_sync();  // a pending refresh can now establish the new authoritative book
     }
     if (check_after) {
         has_pending_check_ = false;
@@ -246,6 +291,9 @@ Emit SymbolBook::on_diff(const DepthDiff& diff) noexcept {
             return {};
         }
     }
+    if (refresh_enabled_ && has_pending_snapshot_)
+        try_sync();
+    consider_refresh();
     return Emit{true, 'D', diff_side(diff)};
 }
 
@@ -289,9 +337,9 @@ Emit SymbolBook::on_trade(const Trade& trade, bool trade_rows) noexcept {
 
 Emit SymbolBook::on_snapshot(const DepthSnapshot& snapshot) noexcept {
     outstanding_ = false;
-    if (state_ == SyncState::Synced) {
-        return {};  // only a background refresh (M7) would use it
-    }
+    if (state_ == SyncState::Synced && !refresh_enabled_)
+        return {};
+    needs_snapshot_ = false;
     pending_snapshot_.last_update_id = snapshot.last_update_id;
     pending_snapshot_.bids.assign(snapshot.bids.begin(), snapshot.bids.end());
     pending_snapshot_.asks.assign(snapshot.asks.begin(), snapshot.asks.end());
@@ -305,7 +353,7 @@ Emit SymbolBook::on_snapshot_error(bool oversized) noexcept {
         ++counters_.oversized_events;
     }
     outstanding_ = false;
-    if (state_ == SyncState::Unsynced) {
+    if (state_ == SyncState::Unsynced || refresh_enabled_) {
         needs_snapshot_ = true;
     }
     return {};
