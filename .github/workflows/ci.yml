@@ -147,3 +147,33 @@ jobs:
           # Runner kernels with high vm.mmap_rnd_bits can make older sanitizer runtimes abort
           # with "unexpected memory mapping"; disabling ASLR for the test process avoids it.
           setarch "$(uname -m)" -R ./build/asan/tests/unit_tests
+
+  tsan:
+    name: TSan (RelWithDebInfo)
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
+      options: --cap-add=SYS_PTRACE --security-opt seccomp=unconfined
+    env:
+      CXX: g++-12
+      BLC_TEST_TIME_SCALE: "10"
+      TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          apt-get install -y $README_APT_PACKAGES $CI_APT_PACKAGES util-linux
+
+      - uses: actions/checkout@v5
+
+      - name: Configure and build
+        run: |
+          cmake --preset tsan
+          cmake --build build/tsan --target unit_tests
+
+      - name: Unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # See the asan-ubsan job: disabling ASLR avoids "unexpected memory mapping" aborts.
+          setarch "$(uname -m)" -R ./build/tsan/tests/unit_tests
