@@ -51,7 +51,9 @@ add_library(blc_net STATIC
     blc/net/endpoints.cpp
     blc/net/rest_scheduler.cpp
     blc/net/rest_transport.cpp
-    blc/net/tls.cpp)
+    blc/net/tls.cpp
+    blc/net/ws_shard.cpp
+    blc/net/capture_app.cpp)
 target_link_libraries(blc_net PUBLIC blc_core Boost::headers OpenSSL::SSL OpenSSL::Crypto
     Threads::Threads)
 target_compile_definitions(blc_net PUBLIC BOOST_ASIO_NO_DEPRECATED)
@@ -59,10 +61,14 @@ if(WIN32)
     target_link_libraries(blc_net PUBLIC ws2_32 mswsock crypt32)
     target_compile_definitions(blc_net PUBLIC _WIN32_WINNT=0x0A00)
 endif()
+if(MINGW)
+    # Beast's composed asynchronous operations exceed PE's default section-count limit.
+    target_compile_options(blc_net PRIVATE -Wa,-mbig-obj)
+endif()
 blc_set_warnings(blc_net)
 
 add_executable(binance_capture main.cpp)
-target_link_libraries(binance_capture PRIVATE blc_core)
+target_link_libraries(binance_capture PRIVATE blc_core blc_net)
 blc_set_warnings(binance_capture)
 
 # The README and reviewer checklist invoke ./build/binance_capture.

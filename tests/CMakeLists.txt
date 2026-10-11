@@ -49,11 +49,18 @@ add_executable(unit_tests
     net_attempt_limiter_test.cpp
     net_dispatch_policy_test.cpp
     net_rest_scheduler_test.cpp
+    net_budget_test.cpp
+    net_capture_loopback_test.cpp
+    support/test_ca.cpp
+    support/loopback_server.cpp
     support/counting_allocator.cpp
     support/exchange_sim.cpp
     support/loss_scenario.cpp
     support/payload_json.cpp)
 target_link_libraries(unit_tests PRIVATE blc_core blc_net GTest::gtest_main)
+if(MINGW)
+    target_compile_options(unit_tests PRIVATE -Wa,-mbig-obj)
+endif()
 set(BLC_TEST_SOURCE_DIR "${PROJECT_SOURCE_DIR}")
 configure_file(support/paths.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/support/paths.hpp" @ONLY)
 target_include_directories(unit_tests PRIVATE

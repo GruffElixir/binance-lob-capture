@@ -30,6 +30,7 @@ public:
     FrameResult on_frame(std::string_view frame, std::int64_t recv_ns,
                          std::int64_t steady_ns) noexcept;
     bool lost() const noexcept { return lost_; }
+    std::uint16_t shard_id() const noexcept { return shard_; }
 
     // Any read error, close or loss: the connection is no longer established.
     void on_disconnected() noexcept { established_ = false; }
