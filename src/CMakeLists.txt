@@ -14,6 +14,7 @@ add_library(blc_core STATIC
     blc/core/time.cpp
     blc/csv/csv_reader.cpp
     blc/csv/csv_writer.cpp
+    blc/csv/rows.cpp
     blc/parse/envelope.cpp
     blc/parse/json_workspace.cpp
     blc/parse/payload_parser.cpp
@@ -25,7 +26,9 @@ add_library(blc_core STATIC
     blc/pipeline/row_format.cpp
     blc/pipeline/snapshot_requester.cpp
     blc/pipeline/spsc_ring.cpp
-    blc/util/logging.cpp)
+    blc/replay/replay.cpp
+    blc/util/logging.cpp
+    blc/verify/verify.cpp)
 target_include_directories(blc_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_BINARY_DIR}/generated")

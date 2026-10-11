@@ -2,6 +2,7 @@
 
 #include "blc/cli/options.hpp"
 #include "blc/core/errors.hpp"
+#include "blc/replay/replay.hpp"
 #include "blc/version.hpp"
 
 #include <exception>
@@ -17,8 +18,9 @@ int main(int argc, char* argv[]) {
             case blc::Mode::Version:
                 std::cout << "binance_capture " << blc::kVersion << '\n';
                 return 0;
-            case blc::Mode::Capture:
             case blc::Mode::Replay:
+                return blc::run_replay(options.replay);
+            case blc::Mode::Capture:
                 std::cerr << "binance_capture: not implemented yet\n";
                 return 2;
         }

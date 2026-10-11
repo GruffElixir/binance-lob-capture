@@ -46,6 +46,7 @@ include(Sanitizers)
 
 add_subdirectory(third_party/simdjson)
 add_subdirectory(src)
+add_subdirectory(tools)
 
 if(BLC_BUILD_TESTS)
     enable_testing()
