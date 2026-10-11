@@ -39,7 +39,13 @@ add_executable(unit_tests
     pipeline_spsc_ring_test.cpp
     pipeline_frame_router_test.cpp
     pipeline_output_files_test.cpp
-    support/exchange_sim.cpp)
+    pipeline_processor_test.cpp
+    pipeline_loss_integration_test.cpp
+    pipeline_allocation_test.cpp
+    support/counting_allocator.cpp
+    support/exchange_sim.cpp
+    support/loss_scenario.cpp
+    support/payload_json.cpp)
 target_link_libraries(unit_tests PRIVATE blc_core GTest::gtest_main)
 set(BLC_TEST_SOURCE_DIR "${PROJECT_SOURCE_DIR}")
 configure_file(support/paths.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/support/paths.hpp" @ONLY)

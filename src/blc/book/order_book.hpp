@@ -46,6 +46,9 @@ public:
     const Coverage& coverage(Side side) const noexcept {
         return side == Side::Bid ? bid_coverage_ : ask_coverage_;
     }
+    std::size_t retained_bytes() const noexcept {
+        return (bids_.capacity() + asks_.capacity()) * sizeof(Level);
+    }
     const BookSide<Side::Bid>& bids() const noexcept { return bids_; }
     const BookSide<Side::Ask>& asks() const noexcept { return asks_; }
 

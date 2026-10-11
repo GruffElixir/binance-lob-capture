@@ -70,4 +70,9 @@ std::int64_t wall_clock_ns() noexcept {
     return duration_cast<nanoseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+std::int64_t steady_clock_ns() noexcept {
+    using namespace std::chrono;
+    return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+}
+
 }  // namespace blc

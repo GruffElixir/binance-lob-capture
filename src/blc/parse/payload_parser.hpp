@@ -36,6 +36,8 @@ public:
     static DepthDiff make_diff();
     static DepthSnapshot make_snapshot();
 
+    std::size_t retained_bytes() const noexcept { return parser_.capacity(); }
+
 private:
     simdjson::ondemand::parser parser_;
 };

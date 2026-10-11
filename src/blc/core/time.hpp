@@ -32,4 +32,7 @@ std::string utc_compact_stamp(std::int64_t ns);
 // Wall-clock time (CLOCK_REALTIME) in nanoseconds since the Unix epoch.
 std::int64_t wall_clock_ns() noexcept;
 
+// Monotonic clock in nanoseconds (latency measurement only; never written to a CSV).
+std::int64_t steady_clock_ns() noexcept;
+
 }  // namespace blc

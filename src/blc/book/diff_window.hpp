@@ -43,6 +43,9 @@ public:
     bool empty() const noexcept { return count_ == 0; }
     DiffView at(std::size_t i) const noexcept;  // 0 is the oldest
     std::uint64_t trimmed() const noexcept { return trimmed_; }
+    std::size_t retained_bytes() const noexcept {
+        return levels_.capacity() * sizeof(Level) + headers_.capacity() * sizeof(Header);
+    }
 
 private:
     struct Header {

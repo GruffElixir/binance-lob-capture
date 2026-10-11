@@ -91,6 +91,12 @@ public:
     SyncState state() const noexcept { return state_; }
     const OrderBook& book() const noexcept { return book_; }
     const DiffWindow& window() const noexcept { return window_; }
+    // Capacity of everything this symbol keeps between records.
+    std::size_t retained_bytes() const noexcept {
+        return book_.retained_bytes() + window_.retained_bytes() +
+               (pending_snapshot_.bids.capacity() + pending_snapshot_.asks.capacity()) *
+                   sizeof(Level);
+    }
 
 private:
     Emit try_sync() noexcept;
