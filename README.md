@@ -137,6 +137,7 @@ with its adjacent sidecar; malformed input fails with a line diagnostic and remo
 output. Replay makes no network calls (`strace` CI gate). `blc_verify --epoch-log capture.log
 output/*.csv` also reconciles frame accounting per epoch. Replay equality proves consistency;
 hand-derived fixtures and independent full-book oracles separately check correctness.
+Use the same `--no-trade-rows` setting for capture and replay to reproduce the same row policy.
 
 Periodic `stats` and final `summary` report frames/rows, parsing/drops, gaps/resyncs, coverage,
 refresh, depth5 attempts and levels compared, REST weight/failures/cooldowns, reconnects,

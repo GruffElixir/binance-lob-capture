@@ -1,6 +1,6 @@
 # Implementation verification
 
-The remaining implementation is on `codex/complete-binance-capture`, starting from `5fe6bb0`.
+The completed implementation is merged into `main` and tagged `v1.0.0`, continuing from `5fe6bb0`.
 The assignment contracts are tracked in [requirements.md](requirements.md); the implementation
 and its rationale are in [design.md](design.md). Real traffic and performance measurements are
 recorded in [benchmarks.md](benchmarks.md).
@@ -68,7 +68,8 @@ no sockets. Live public endpoint availability is probed separately from determin
   Clang compile database and a source-only header filter. Suppressions name a specific check
   and explain the reserved storage or simdjson rvalue API requirement.
 - Public repository visibility was explicitly authorized by the user on 2026-10-11 and
-  applied immediately. The annotated submission tag remains a final release step.
+  applied immediately. The user subsequently authorized integration on `main` and publication
+  of the annotated submission tag.
 - Docker was unavailable, so release validation used a fresh official Jammy filesystem with
   independent packages and checkout in a chroot under WSL. The host kernel is shared, as it
   would be for a container; existing development headers/build caches were not exposed.
@@ -87,7 +88,22 @@ no sockets. Live public endpoint availability is probed separately from determin
 | 32 | Complete | `2f2bece`; both-venue 10-minute and 30-minute Spot [live results](benchmarks.md) |
 | 33 | Complete | `b29ad26`; coverage refresh, independent property oracle and allocation tests |
 | 35–36 | Complete | `5f8a312`, `2f2bece`; real sample, README, exact command manifest and clean checklist |
-| 37 | Release integration remains | Public visibility done; annotated `v1.0.0` and final S5 bookkeeping follow integration |
+| 37 | Complete | Public repository, merged release, verified annotated `v1.0.0`, green tag CI and S5 bookkeeping on `main` |
+
+## Release verification
+
+- The merged `1.0.0` build passed **302/302 tests**, README/credential checks and reports
+  `binance_capture 1.0.0`. Rebuilt Linux Release and Windows capture binaries reproduce the
+  committed sample byte-for-byte.
+- Annotated tag `v1.0.0`, annotation **Submission v1.0.0**, has object
+  `887cab6599be966b2b419c30448a1b68b33dda53` and commit target
+  `a6f4dadc2c9a1d06dcd85e972ee23887208c3ed6`. Both remote refs were checked against the local tag.
+- [Tag CI 38166438890](https://github.com/GruffElixir/binance-lob-capture/actions/runs/38166438890)
+  passed all nine mandatory jobs, including both sanitizer suites. The same `1.0.0` source
+  independently passed [PR CI 38165878264](https://github.com/GruffElixir/binance-lob-capture/actions/runs/38165878264).
+- S5 was marked Done only after the annotated tag was pushed and verified. This documentation
+  follow-up on `main` records that completed gate; it does not move or recreate the release tag.
+  Every mandatory and completed stretch requirement is now Done.
 
 ## Final independent review
 
