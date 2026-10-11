@@ -384,7 +384,9 @@ not, the snapshot is rejected as too old and a fresh one is requested.
    - The processor requests a snapshot when the symbol enters Unsynced (§5.7) and whenever it
      discards one.
    - A request is published by storing `(epoch, request number)` into the symbol's request
-     slot (§6.1), where the request number increases with every request. The scheduler always
+     slot (§6.1). The request number starts at 1 and increases with every request; the value 0
+     is reserved for "no request", so a symbol's first request on epoch 0 is still a change the
+     io thread notices. The scheduler always
      serves the newest value in a slot (§6.3). A request is therefore never lost when it is
      superseded, discarded as non-current, or issued again within the same epoch.
    - While a request for the current epoch is outstanding, the processor does not publish
@@ -525,7 +527,7 @@ processed normally. On every other cause it runs while the record is processed.
 | depth5 or trade payload parse error | Counted; no row; book unchanged |
 | Payload `s` (when present; spot depth5 and REST snapshots have none) ≠ stream symbol | Parse error (defensive) |
 | Snapshot too old or not authoritative | Discarded; a new one is requested (§5.4) |
-| REST transport failure, 429 or 418 | Retried by the scheduler (§6.3) |
+| REST transport failure, 5xx, 429 or 418 | Retried by the scheduler (§6.3) |
 | REST 4xx other than 429/418 (for example 400 `-1121 Invalid symbol`) | Fatal configuration error: shutdown with exit code 1. Unknown symbols are normally caught earlier by startup validation (§6.3) |
 | Frame lost before the processor (ring full, or invalid envelope) | Shard loss transition (§6.2): the rest of the connection is withheld and the shard reconnects. Each of its symbols resets at its first record of the new epoch, so no row is ever built on a book that missed a frame |
 | Valid envelope for an unsubscribed stream | Counted only; no market-data row; its `conn_seq` number stays unused |
@@ -686,8 +688,12 @@ budget. Limits verified live on 2026-10-11 via `exchangeInfo` and `X-MBX-USED-WE
 - **429 / 418:** a global cooldown pauses all dispatch for `Retry-After` seconds (60 s if
   absent); the failed request is requeued at the head. 418 (IP ban) is also logged as an error.
   No request is sent during a cooldown.
-- **Transport errors and timeouts** (10 s per request; body ≤ 1 MiB): requeued with per-request
-  backoff (500 ms → 30 s), still subject to the bucket and any cooldown.
+- **Transport errors, timeouts and HTTP 5xx** (10 s per request; body ≤ 1 MiB), and any other
+  non-200 status not listed here: requeued with per-request backoff (500 ms → 30 s), still
+  subject to the bucket and any cooldown.
+- **Requeuing a failed request** (429, 418, transport or 5xx): if a newer value is already
+  waiting in the symbol's slot, only that newer value is queued. The failed request is dropped,
+  so a symbol never has more than one queued request.
 - **Delivery:** every request carries the epoch it was made for (§5.4). A `200` response is
   delivered only if that epoch is still the shard's current established connection and no loss
   has occurred on it. It is then pushed to the ring as a snapshot record stamped with that
@@ -1115,6 +1121,7 @@ docs/                      design.md, requirements.md
 | `blc_net` (static) | `net` | `blc_core`, Boost (Asio, Beast), OpenSSL, Threads |
 | `binance_capture` | `main.cpp` → `./build/binance_capture` | `blc_core`, `blc_net` |
 | `unit_tests` | `tests/` → `./build/tests/unit_tests`; built by target `tests` | `blc_core`, `blc_net`, GoogleTest |
+| `blc_verify` | `tools/` → `./build/tools/blc_verify`; built by default, so it is covered by the warning-free build check | `blc_core` |
 | `blc_bench` | `bench/` | `blc_core` |
 
 Keeping Boost out of `blc_core` keeps the book, CSV and replay logic independent of the network
@@ -1194,11 +1201,10 @@ results derived independently of the code under test.
 | **Exchange simulator** (property test) | A reference "exchange" holds a full-depth book and generates random activity: diffs, depth5, trades, REST snapshots truncated to 1 000 levels, reconnects. The output is fed through the processor. Every emitted row must equal the simulator's true top 5 at that point, and output may be suppressed only when the rules require it. 10⁵+ steps across seeds, both venues |
 | **Scenario fixtures** | Small hand-written market-data + sidecar files with hand-derived expected order-book CSVs: initial sync with overlap, spot/usdm bridge boundaries, gap → resync, two symbols on one shard across a reconnect (each replayed alone), coverage exhaustion, depth5 mismatch → resync, depth5 extending beyond coverage (no false mismatch), oversized diff, sync completed by a later diff, reversed envelope, trade side mapping, and two successive same-day runs with the first run's archived set replayed from its `replaced_<…>/` directory |
 | **Consistency** | Golden-file replay of captured fixtures; live → replay `cmp` on `samples/` |
-| **`capture_loopback` integration** (CI, under ASan+LSan and TSan) | Exercises the real `WsShard`, `RestScheduler` and TLS stack against an in-process server on 127.0.0.1: a Beast TLS WebSocket server plus HTTPS `depth` and `ticker/price` endpoints (the latter
-answering valid and invalid symbols, so startup validation runs for real). A test CA and server certificate are generated in memory at test start (no key material is committed) and injected into the client's `ssl::context`, so peer and hostname verification stay on. Endpoints and CA reach the client through the library-level capture configuration, not the CLI. Covers connect, frames, snapshot sync, 429 cooldown, server-forced reconnect, a loss transition, SIGINT via `raise`, a second SIGINT, and `--duration` expiry. Asserts correct outputs, a clean exit, and no leak or race reports |
+| **`capture_loopback` integration** (CI, under ASan+LSan and TSan) | Exercises the real `WsShard`, `RestScheduler` and TLS stack against an in-process server on 127.0.0.1: a Beast TLS WebSocket server plus HTTPS `depth` and `ticker/price` endpoints (the latter answering valid and invalid symbols, so startup validation runs for real). A test CA and server certificate are generated in memory at test start (no key material is committed) and injected into the client's `ssl::context`, so peer and hostname verification stay on. Endpoints and CA reach the client through the library-level capture configuration, not the CLI. Covers connect, frames, snapshot sync, 429 cooldown, server-forced reconnect, a loss transition, SIGINT via `raise`, a second SIGINT, and `--duration` expiry. Asserts correct outputs, a clean exit, and no leak or race reports |
 | `replay` CLI | Replay through the `market_data_*.csv` glob skips order-book files; one failing file does not stop the others; exit codes 0/1/2 |
 | `live_smoke.sh` (local) | 60 s live capture per venue with an ASan build, ended by SIGINT (zero LSan reports); `verify_outputs.sh`; replay → `cmp`; `depth5_mismatch=0` for each venue on the `resync` policy (a venue on `count-only`, §5.6, only reports its rate); peak RSS within budget |
-| `rest_scheduler` | Token bucket and FIFO order; header reconciliation; global 429/418 cooldown; slot replacement when a newer `(epoch, request number)` arrives while a request is queued, and again while one is in flight (the newer one is served after it completes); non-current responses discarded; other 4xx fatal |
+| `rest_scheduler` | Token bucket and FIFO order; header reconciliation; global 429/418 cooldown; slot replacement when a newer `(epoch, request number)` arrives while a request is queued, and again while one is in flight (the newer one is served after it completes); the first request on epoch 0 is noticed (0 = no request); a failed request with a newer value waiting requeues only the newer one; 5xx retried; non-current responses discarded; other 4xx fatal |
 
 TDD applies: each module's tests are written before its implementation.
 
@@ -1271,7 +1277,7 @@ requirement row it delivers moved to **Done** in [requirements.md](requirements.
 | M1 | Core primitives: `types`, `decimal`, `time`, `instrument_id`, `symbols`, CSV schema/writer/reader, CLI options, logging. CI: clang-format, ASan + UBSan | M0 | Unit tests green under ASan + UBSan |
 | M2 | Parsing: vendored simdjson, envelope split (fast path + order-independent fallback), payload parsers with decoded-size limits, real-payload fixtures | M1 | Parser and limit tests green |
 | M3 | Order book: `book_side`, coverage, sequence classifier, recent-diff window, sync state machine, depth5 check, exchange simulator | M2 | Simulator property test and sync, coverage and depth5 suites green |
-| M4 | Pipeline + replay: SPSC ring first, alone (TSan job); then `FrameRouter` with the loss transition, processor, output files with archive rule, sidecar, replay mode, scenario fixtures, `loss` integration test, allocation test. CI: output contract (scenario part), Valgrind | M3 | Every scenario fixture replays to its hand-derived expected output; `loss` integration test green; zero allocations |
+| M4 | Pipeline + replay: SPSC ring first, alone (TSan job); then `FrameRouter` with the loss transition, processor, output files with archive rule, sidecar, replay mode, `blc_verify`, scenario fixtures, `loss` integration test, allocation test. CI: output contract (scenario part), Valgrind | M3 | Every scenario fixture replays to its hand-derived expected output; `loss` integration test green; zero allocations |
 | M5 | Networking (needs WSL): endpoints, TLS, `WsShard`, REST scheduler with startup symbol validation, capture app, signals and `--duration`, shutdown protocol, metrics and stats, `capture_loopback` integration test (CI under ASan and TSan) | M4 | Loopback test green under both sanitizers; `live_smoke.sh` (ASan build) passes for both venues; frame-accounting invariant holds |
 | M6 | Hardening: clang-tidy job, `--fault-reconnect-every`, shutdown tests, limit validation, book benchmark (flat vector vs `std::map`, backs Q11), 10-minute depth5 and 30-minute coverage runs, RSS acceptance on long runs | M5 | All CI jobs green; `depth5_mismatch=0` live, or, if a venue had to fall back to `count-only` (§5.6), its measured rate documented with evidence; `VmHWM ≤ budget_mib`; book benchmark numbers in README |
 | M7 *(optional)* | Enhancement and performance: background coverage refresh (§5.5), remaining benchmarks and performance notes (X3) | M6 | Refresh suite green; live 30-minute run recorded; benchmark numbers in README |
