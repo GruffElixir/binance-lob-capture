@@ -1171,7 +1171,7 @@ src/
                            rest_scheduler.{hpp,cpp}, capture_app.{hpp,cpp}
     cli/                   options.{hpp,cpp}
     util/                  logging.{hpp,cpp}
-third_party/simdjson/      simdjson.h, simdjson.cpp, LICENSE, VERSION (pinned release)
+third_party/simdjson/      simdjson.h, simdjson.cpp, LICENSE, VERSION.txt (pinned release)
 tests/                     one test file per module; fixtures/ (real captured payloads);
                            scenarios/ (hand-built inputs with hand-derived expected outputs)
 bench/                     blc_bench (BLC_BUILD_BENCH=OFF by default)
@@ -1211,7 +1211,7 @@ passes a no-op implementation. The allocation test (§10) uses the real slots.
 |---|---|---|
 | Boost (Asio, Beast) | ≥ 1.74 (jammy) | `libboost-all-dev`; header-only use |
 | OpenSSL | ≥ 1.1.1 (jammy: 3.0) | `libssl-dev` |
-| simdjson | 4.6.11, recorded in `third_party/simdjson/VERSION` (latest of the mature 4.x line; 5.0 shipped 2026-09-28 and is still taking patch releases) | Vendored single-header amalgamation |
+| simdjson | 4.6.11, recorded in `third_party/simdjson/VERSION.txt` (latest of the mature 4.x line; 5.0 shipped 2026-09-28 and is still taking patch releases) | Vendored single-header amalgamation |
 | GoogleTest | 1.17.0 | CMake `FetchContent`, URL + SHA-256 pinned, tests only |
 | zlib | jammy | Listed in the brief's package list; not linked (Binance does not negotiate `permessage-deflate`) |
 
@@ -1339,6 +1339,15 @@ TDD applies: each module's tests are written before its implementation.
    the results in the README.
 3. **US IP block (M5):** confirm GitHub-hosted runners receive HTTP 451 from Binance; if they do
    not, a live smoke job is added to CI.
+
+**Implementation results (2026-10-11):** all three gates above passed. The real implementation
+completed both-venue 10-minute captures and 30-minute Spot captures before and after coverage
+refresh, with positive comparisons, zero mismatches and RSS below the 84 MiB budget. The earlier
+30-minute run exhausted coverage once and resynced; the refresh-enabled run needed neither
+refresh nor resync in that market window. Independent tests exercise refresh paths.
+[Recorded measurements](benchmarks.md) include exact counts and replay equality. The
+[GitHub-hosted probe](https://github.com/GruffElixir/binance-lob-capture/actions/runs/38162922191)
+returned HTTP 451 for both venues; deterministic TLS loopback tests remain the CI network gate.
 
 ## 16. Milestones
 

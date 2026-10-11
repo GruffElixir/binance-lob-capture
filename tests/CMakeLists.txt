@@ -16,12 +16,62 @@ FetchContent_MakeAvailable(googletest)
 
 # Lands at ./build/tests/unit_tests, the path used by the README and the reviewer checklist.
 add_executable(unit_tests
-    smoke_test.cpp)
-target_link_libraries(unit_tests PRIVATE blc_core GTest::gtest_main)
+    smoke_test.cpp
+    core_time_test.cpp
+    core_instrument_id_test.cpp
+    core_decimal_test.cpp
+    csv_schema_test.cpp
+    csv_writer_test.cpp
+    csv_reader_test.cpp
+    core_symbols_test.cpp
+    cli_options_test.cpp
+    simdjson_smoke_test.cpp
+    parse_envelope_test.cpp
+    parse_stream_table_test.cpp
+    parse_payload_test.cpp
+    book_side_test.cpp
+    book_coverage_test.cpp
+    book_sequence_test.cpp
+    book_diff_window_test.cpp
+    book_depth5_check_test.cpp
+    book_sync_test.cpp
+    book_refresh_test.cpp
+    book_property_test.cpp
+    pipeline_spsc_ring_test.cpp
+    pipeline_frame_router_test.cpp
+    pipeline_output_files_test.cpp
+    pipeline_processor_test.cpp
+    pipeline_loss_integration_test.cpp
+    pipeline_allocation_test.cpp
+    pipeline_consumer_test.cpp
+    replay_test.cpp
+    scenarios_test.cpp
+    net_endpoints_test.cpp
+    net_attempt_limiter_test.cpp
+    net_dispatch_policy_test.cpp
+    net_rest_scheduler_test.cpp
+    net_rest_transport_test.cpp
+    net_budget_test.cpp
+    net_capture_loopback_test.cpp
+    support/test_ca.cpp
+    support/loopback_server.cpp
+    support/counting_allocator.cpp
+    support/exchange_sim.cpp
+    support/loss_scenario.cpp
+    support/payload_json.cpp)
+target_link_libraries(unit_tests PRIVATE blc_core blc_net GTest::gtest_main)
+if(MINGW)
+    target_compile_options(unit_tests PRIVATE -Wa,-mbig-obj)
+endif()
+set(BLC_TEST_SOURCE_DIR "${PROJECT_SOURCE_DIR}")
+configure_file(support/paths.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/support/paths.hpp" @ONLY)
+target_include_directories(unit_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
 blc_set_warnings(unit_tests)
 
 # `cmake --build build --target tests` is the documented way to build the test suite.
 add_custom_target(tests DEPENDS unit_tests)
 
 include(GoogleTest)
-gtest_discover_tests(unit_tests)
+gtest_discover_tests(unit_tests DISCOVERY_MODE PRE_TEST)

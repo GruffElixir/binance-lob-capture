@@ -15,7 +15,7 @@ if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
 endif()
 
 project(binance_lob_capture
-    VERSION 0.1.0
+    VERSION 1.0.0
     DESCRIPTION "Binance WebSocket market-data capture (CSV) + local order book (CSV)"
     LANGUAGES CXX)
 
@@ -31,14 +31,26 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(BLC_BUILD_TESTS "Build the unit tests (target: tests)" ON)
+option(BLC_BUILD_BENCH "Build reproducible performance benchmarks" OFF)
 option(BLC_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 set(BLC_SANITIZER "" CACHE STRING "Sanitizers: empty, 'address,undefined' or 'thread'")
+
+# Windows/MSYS2 development builds only: link the runtime statically so an unrelated
+# libstdc++-6.dll earlier on PATH (for example Git for Windows') is never picked up.
+if(MINGW)
+    add_link_options(-static)
+endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
 include(Sanitizers)
 
+add_subdirectory(third_party/simdjson)
 add_subdirectory(src)
+add_subdirectory(tools)
+if(BLC_BUILD_BENCH)
+    add_subdirectory(bench)
+endif()
 
 if(BLC_BUILD_TESTS)
     enable_testing()

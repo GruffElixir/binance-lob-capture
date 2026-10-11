@@ -1,0 +1,5 @@
+add_executable(blc_bench main.cpp book_bench.cpp payload_bench.cpp pipeline_bench.cpp)
+target_link_libraries(blc_bench PRIVATE blc_core)
+target_compile_definitions(blc_bench PRIVATE BLC_BENCH_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+blc_set_warnings(blc_bench)
+set_target_properties(blc_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")

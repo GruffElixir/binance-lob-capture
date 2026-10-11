@@ -1,8 +1,8 @@
-#include <gtest/gtest.h>
+#include "blc/version.hpp"
 
 #include <algorithm>
 
-#include "blc/version.hpp"
+#include <gtest/gtest.h>
 
 namespace {
 

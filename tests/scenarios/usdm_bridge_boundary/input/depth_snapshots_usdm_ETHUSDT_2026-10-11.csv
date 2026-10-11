@@ -1,0 +1,2 @@
+recv_tsec,recv_tnsec,venue,shard_id,conn_epoch,symbol,apply_before_row,payload_json
+1791669450,1000000,usdm,0,0,ETHUSDT,1,"{""lastUpdateId"":305,""E"":1791669450000,""T"":1791669450000,""bids"":[[""20.00000000"",""1.00000000""],[""19.00000000"",""1.00000000""]],""asks"":[[""21.00000000"",""1.00000000""]]}"
