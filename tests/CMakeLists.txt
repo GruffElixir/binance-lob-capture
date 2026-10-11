@@ -21,7 +21,8 @@ add_executable(unit_tests
     core_instrument_id_test.cpp
     core_decimal_test.cpp
     csv_schema_test.cpp
-    csv_writer_test.cpp)
+    csv_writer_test.cpp
+    csv_reader_test.cpp)
 target_link_libraries(unit_tests PRIVATE blc_core GTest::gtest_main)
 target_include_directories(unit_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 blc_set_warnings(unit_tests)
