@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/context.hpp>
 
 namespace blc {
@@ -19,8 +20,12 @@ namespace blc {
 // response is complete.
 class BeastRestTransport final : public RestTransport {
 public:
+    using ResolveDone = std::function<void(boost::system::error_code,
+                                           boost::asio::ip::tcp::resolver::results_type)>;
+    using ResolveFn = std::function<void(const Endpoint&, ResolveDone)>;
+    // Optional library-only resolver injection for deterministic deadline tests.
     BeastRestTransport(boost::asio::io_context& io, boost::asio::ssl::context& tls,
-                       JsonWorkspace& workspace, const NetTuning& tuning);
+                       JsonWorkspace& workspace, const NetTuning& tuning, ResolveFn resolve = {});
     ~BeastRestTransport() override;
     BeastRestTransport(const BeastRestTransport&) = delete;
     BeastRestTransport& operator=(const BeastRestTransport&) = delete;
@@ -38,6 +43,7 @@ private:
     boost::asio::ssl::context& tls_;
     JsonWorkspace& workspace_;
     NetTuning tuning_;
+    ResolveFn resolve_;
     std::vector<std::weak_ptr<Session>> sessions_;
     bool stopped_ = false;
 };

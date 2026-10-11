@@ -40,8 +40,10 @@ names lowercase. Venue defaults to spot, output directory to `.`, duration to un
 Duration includes validation and is measured from process start. Ctrl-C/SIGTERM requests an
 orderly shutdown; a second signal forces network shutdown while committed input still drains.
 Exit codes: 0 normal, 1 runtime/I/O failure, 2 invalid options or invalid symbol.
+Expiry or a signal during symbol validation exits 0 before files are opened. After validation,
+stopping before initial book sync leaves valid header-only files and a final summary.
 
-Other options: `--symbols-per-connection 50`, `--trade-rows on|off` (default on),
+Other options: `--symbols-per-connection 50`, `--no-trade-rows` (trades enabled by default),
 `--stats-interval 10` (0: final summary only), `--fault-reconnect-every N` (0: disabled), and
 `--help`. Files are `market_data_<venue>_<SYMBOL>_<UTC-start-date>.csv`, the same stem with
 `_orderbook.csv`, and `depth_snapshots_<venue>_<SYMBOL>_<UTC-start-date>.csv`. A run keeps one
@@ -149,13 +151,15 @@ symbols. Budgets including network transients and a 48 MiB allowance are 84 MiB 
 shard), 429 MiB (256/64), and 353 MiB (256/6). Attempts are capped at 200 per sliding five
 minutes process-wide. Reconnects use jittered bounded backoff; REST uses half the weight budget
 and pauses globally on 429/418. TLS always verifies the system CA chain and hostname.
+The REST request deadline includes DNS resolution. Cancellation releases the request slot;
+Boost's system resolver can still wait for an OS DNS call when its worker is destroyed.
 
 ## Public configuration and samples
 
 No credentials are needed. `.env.example` has comments only; the program reads CLI options
 and no environment configuration. Ordinary CSV/build artifacts are ignored; curated samples
-and test fixtures are tracked. The brief's literal `git grep -i "api_key|secret|password"`
-uses basic regex (unescaped `|` is literal). The intended extended-regex version also matches
+and test fixtures are tracked. The brief's grep joins `api_key`, `secret` and `password` with
+`|` and uses basic regex (unescaped `|` is literal). The extended-regex version also matches
 documentation words. CI checks the extended interpretation outside documentation/ignore
 files and ensures the example has no values.
 
@@ -163,6 +167,11 @@ files and ensures the example has no values.
 in CI. `scripts/live_smoke.sh` checks real traffic, sanitizers, frame accounting, schema and
 replay, including two shards. Binance regional availability makes live checks unsuitable as
 a deterministic CI gate; loopback and scenario tests supply that gate.
+The refresh-enabled 30-minute Spot run emitted 61,064 market rows and 61,055 book rows, with
+18,120 full depth5 checks, zero mismatches/drops/coverage exhaustion and 30,692 KiB peak RSS.
+The 10-minute USD-M run passed 5,405 partial checks with zero mismatches and 30,940 KiB peak RSS.
+Refresh was unnecessary in those market conditions; independent tests exercise its swaps and
+depletion paths. [Live results](docs/benchmarks.md) also record the earlier exhaustion runs.
 
 First three data rows from the committed run (payload fields shortened for readability;
 full payloads are in the linked CSVs):

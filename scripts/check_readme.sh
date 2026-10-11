@@ -18,4 +18,9 @@ for entry in 'build/' '*.csv' '*.o' '*.a' '*.so' '.env' 'config/sec'"rets.json";
     grep -Fxq "$entry" .gitignore
 done
 scripts/check_credentials.sh
+pattern='api'"_key|sec"'ret|pass'"word"
+if git grep -i "$pattern"; then
+    echo 'literal reviewer grep returned a match' >&2
+    exit 1
+fi
 echo 'README OK'

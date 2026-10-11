@@ -36,15 +36,19 @@ public:
             });
     }
     void abort() noexcept {
-        resolver_.cancel();
-        close_timer_.cancel();
-        // Boost 1.74 retains its handshake/idle timer after a raw socket cancellation.
-        // Disable both timers so an aborted handshake cannot keep io.run() alive.
-        websocket::stream_base::timeout timeout{};
-        timeout.handshake_timeout = websocket::stream_base::none();
-        timeout.idle_timeout = websocket::stream_base::none();
-        timeout.keep_alive_pings = false;
-        stream_.set_option(timeout);
+        try {
+            resolver_.cancel();
+            close_timer_.cancel();
+            // Boost 1.74 retains its handshake/idle timer after a raw socket cancellation.
+            // Disable both timers so an aborted handshake cannot keep io.run() alive.
+            websocket::stream_base::timeout timeout{};
+            timeout.handshake_timeout = websocket::stream_base::none();
+            timeout.idle_timeout = websocket::stream_base::none();
+            timeout.keep_alive_pings = false;
+            stream_.set_option(timeout);
+        } catch (...) {
+            // Teardown must still close the socket if timer cancellation reports an error.
+        }
         beast::error_code ignored;
         beast::get_lowest_layer(stream_).socket().close(ignored);
     }
@@ -171,7 +175,7 @@ private:
         const auto result = owner->router_.on_frame(
             {static_cast<const char*>(bytes.data()), bytes.size()}, recv, steady);
         buffer_.consume(buffer_.size());
-        if (buffer_.capacity() > 256 * 1024)
+        if (buffer_.capacity() > std::size_t{256} * 1024)
             buffer_.shrink_to_fit();
         owner->observe_capacity(buffer_.capacity(), true);
         if (owner->stopping_)

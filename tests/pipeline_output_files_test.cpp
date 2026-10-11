@@ -45,6 +45,29 @@ TEST(OutputFiles, Names) {
     EXPECT_EQ(u.market_data, "market_data_usdm_ETHUSDT_2026-01-02.csv");
 }
 
+TEST(OutputFiles, WriteProbePreservesExistingFile) {
+    TempDir dir;
+    const auto probe = dir / ".binance_capture_write_probe";
+    write_file(probe, "existing user data");
+    EXPECT_NO_THROW(prepare_output_dir(dir.path()));
+    EXPECT_TRUE(fs::exists(probe));
+    EXPECT_EQ(read_file(probe), "existing user data");
+}
+
+TEST(OutputFiles, WriteProbePreservesSymlinkAndTarget) {
+    TempDir dir;
+    const auto target = dir / "target.txt";
+    const auto probe = dir / ".binance_capture_write_probe";
+    write_file(target, "symlink target data");
+    std::error_code ec;
+    fs::create_symlink(target, probe, ec);
+    if (ec)
+        GTEST_SKIP() << "symlinks unavailable: " << ec.message();
+    EXPECT_NO_THROW(prepare_output_dir(dir.path()));
+    EXPECT_TRUE(fs::is_symlink(fs::symlink_status(probe)));
+    EXPECT_EQ(read_file(target), "symlink target data");
+}
+
 TEST(OutputFiles, ArchiveWholeSetKeepsNames) {
     TempDir dir;
     const auto names = all_names(file_names(Venue::Spot, "BTCUSDT", "2026-10-11"));

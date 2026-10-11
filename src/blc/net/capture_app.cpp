@@ -170,7 +170,9 @@ private:
             all_names.insert(all_names.end(), {n.market_data, n.orderbook, n.snapshots});
             names.push_back(std::move(n));
         }
-        archive_existing(dir, all_names, utc_compact_stamp(now));
+        if (const auto archive = archive_existing(dir, all_names, utc_compact_stamp(now))) {
+            log(LogLevel::Warn, "capture: existing output moved to " + archive->string());
+        }
         std::vector<std::unique_ptr<SymbolOutput>> outputs;
         for (std::size_t i = 0; i < names.size(); ++i) {
             const auto& symbol = config_.options.symbols[i];

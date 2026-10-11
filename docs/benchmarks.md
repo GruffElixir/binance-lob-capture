@@ -117,3 +117,25 @@ captures on both venues, plus a 60-second spot BTCUSDT/ETHUSDT run on two connec
 outputs verified; Release and multi-symbol outputs replayed identically. Full sanitizer test
 suite: ASan/UBSan/LSan 287 tests and TSan 288 tests passed before adding coverage refresh;
 the final sanitizer gate is rerun after subsequent changes.
+
+## Live verification with coverage refresh
+
+These runs used the refresh-enabled Release binary, with the same gates and mismatch policy.
+Each three-file set verified against epoch accounting and replayed byte-for-byte. All runs
+had zero malformed frames, dropped frames, gaps, parse errors and depth5 mismatches.
+
+| Venue | Seconds | Market rows | Book rows | Syncs | Resyncs | Coverage exhaustion | Refresh swaps | Full depth5 checks | Partial depth5 checks | Peak RSS KiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Spot sample | 120 | 7,107 | 7,098 | 1 | 0 | 0 | 0 | 1,185 | 0 | 30,684 |
+| USD-M | 600 | 23,634 | 23,623 | 1 | 0 | 0 | 0 | 62 | 5,405 | 30,940 |
+| Spot | 1,800 | 61,064 | 61,055 | 1 | 0 | 0 | 0 | 18,120 | 0 | 30,692 |
+
+Actual compared levels were 620 full + 41,626 partial for USD-M and 181,200 full for the
+30-minute Spot run. The one-symbol budget was 84 MiB. Price movement did not reach the refresh
+threshold during these runs, so the zero swap count is not evidence of refresh execution.
+Independent property, hand-derived and allocation tests exercise equal/different swaps,
+delayed bridging, stale snapshots and exhaustion with a pending refresh.
+
+On 2026-10-11, the GitHub-hosted availability probe returned HTTP 451 for both public REST
+endpoints ([workflow run](https://github.com/GruffElixir/binance-lob-capture/actions/runs/38162922191)).
+Live checks remain a local release gate; real TLS loopback tests provide deterministic CI coverage.

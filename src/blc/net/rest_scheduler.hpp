@@ -75,8 +75,6 @@ private:
     void deliver(std::uint16_t symbol, std::uint32_t epoch, HttpResult result);
     void report_validation(ValidationResult result);
 
-    boost::asio::io_context& io_;
-    Venue venue_;
     VenueEndpoints endpoints_;
     NetTuning tuning_;
     RestTransport& transport_;

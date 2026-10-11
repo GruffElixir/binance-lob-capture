@@ -140,7 +140,9 @@ public:
                                      ? owner_.script.first_connection_frames
                                      : owner_.script.frames;
             if (next_ == frames.size()) {
-                if (owner_.script.force_close) {
+                if (owner_.script.force_close &&
+                    (!owner_.script.force_close_first_only || first_) &&
+                    (!owner_.script.force_close_ready || owner_.script.force_close_ready())) {
                     beast::error_code ignored;
                     beast::get_lowest_layer(stream_).close(ignored);
                     return;

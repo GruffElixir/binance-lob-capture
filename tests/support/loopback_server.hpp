@@ -26,6 +26,8 @@ struct ServerScript {
     std::chrono::milliseconds ticker_delay{0};
     std::chrono::milliseconds depth_delay{0};
     bool force_close = false;
+    bool force_close_first_only = false;
+    std::function<bool()> force_close_ready;
     bool repeat_frames = true;
     bool refuse_ws = false;
     bool hold_close = false;

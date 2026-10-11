@@ -1,4 +1,5 @@
 #include "blc/core/symbols.hpp"
+#include "blc/core/time.hpp"
 #include "blc/csv/csv_reader.hpp"
 #include "blc/net/capture_app.hpp"
 #include "blc/verify/verify.hpp"
@@ -131,6 +132,75 @@ int stop_after(LoopbackServer& server, const CaptureConfig& c, std::string event
         std::raise(SIGTERM);
     return result.get();
 }
+struct SyncSignal {
+    std::vector<char> scratch = std::vector<char>(SymbolFiles::kBufferBytes);
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::size_t syncs = 0;
+    void notify() {
+        const std::lock_guard<std::mutex> lock(mutex);
+        ++syncs;
+        cv.notify_all();
+    }
+    bool wait(std::size_t count = 1) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, timeout(), [&] { return syncs >= count; });
+    }
+    bool ready() {
+        const std::lock_guard<std::mutex> lock(mutex);
+        return syncs != 0;
+    }
+};
+class SyncOutput final : public SymbolOutput {
+public:
+    SyncOutput(std::unique_ptr<SymbolOutput> inner, SyncSignal& signal)
+        : inner_(std::move(inner)), signal_(signal) {}
+    void market_row(const RecordView& record, std::string_view payload) noexcept override {
+        inner_->market_row(record, payload);
+    }
+    void snapshot_row(const RecordView& record, std::size_t before,
+                      std::string_view payload) noexcept override {
+        inner_->snapshot_row(record, before, payload);
+    }
+    void book_row(std::int64_t recv, std::uint64_t seq, std::int32_t id, Emit emit,
+                  const TopOfBook& top) noexcept override {
+        inner_->book_row(recv, seq, id, emit, top);
+        if (emit.type == 'R')
+            signal_.notify();
+    }
+    std::size_t market_rows() const noexcept override { return inner_->market_rows(); }
+    bool failed() const noexcept override { return inner_->failed(); }
+    bool flush() noexcept override { return inner_->flush(); }
+    bool finish() noexcept override { return inner_->finish(); }
+    std::size_t retained_bytes() const noexcept override { return inner_->retained_bytes(); }
+
+private:
+    std::unique_ptr<SymbolOutput> inner_;
+    SyncSignal& signal_;
+};
+void observe_sync(CaptureConfig& config, SyncSignal& signal) {
+    config.started_wall_ns = wall_clock_ns();
+    config.output_factory = [&config, &signal](const SymbolSpec& symbol) {
+        const auto names =
+            file_names(config.options.venue, symbol.upper, utc_date(config.started_wall_ns));
+        auto files = std::make_unique<SymbolFiles>(config.options.output_dir, names,
+                                                   signal.scratch.data(), signal.scratch.size());
+        auto output =
+            std::make_unique<FileOutput>(std::move(files), config.options.venue, symbol.upper);
+        return std::make_unique<SyncOutput>(std::move(output), signal);
+    };
+}
+int stop_when_synced(const CaptureConfig& config, SyncSignal& synced, int signal) {
+    auto result = std::async(std::launch::async,
+                             [&] { return run_capture(config, std::chrono::steady_clock::now()); });
+    EXPECT_TRUE(synced.wait());
+    std::raise(signal);
+    const bool ready = result.wait_for(timeout()) == std::future_status::ready;
+    EXPECT_TRUE(ready);
+    if (!ready)
+        std::raise(SIGTERM);
+    return result.get();
+}
 void expect_epoch_sync(const CaptureConfig& c, std::uint32_t epoch) {
     const auto book = rows(c, "_orderbook.csv");
     std::map<std::pair<std::string, std::string>, std::string> epochs;
@@ -149,13 +219,25 @@ void expect_epoch_sync(const CaptureConfig& c, std::uint32_t epoch) {
     EXPECT_TRUE(found);
 }
 TEST(CaptureLoopback, ForcedReconnectStartsNewEpoch) {
+    SyncSignal synced;
     ServerScript script;
     script.frames = frames();
     script.force_close = true;
+    script.force_close_first_only = true;
+    script.force_close_ready = [&] { return synced.ready(); };
     LoopbackServer server(std::move(script), ca());
     auto c = config(server, "reconnect");
-    c.options.duration_s = 2 * scale();
-    EXPECT_EQ(run_capture(c, std::chrono::steady_clock::now()), 0);
+    c.options.duration_s = 0;
+    observe_sync(c, synced);
+    auto result = std::async(std::launch::async,
+                             [&] { return run_capture(c, std::chrono::steady_clock::now()); });
+    EXPECT_TRUE(synced.wait(2));
+    std::raise(SIGINT);
+    const bool ready = result.wait_for(timeout()) == std::future_status::ready;
+    EXPECT_TRUE(ready);
+    if (!ready)
+        std::raise(SIGTERM);
+    EXPECT_EQ(result.get(), 0);
     expect_epoch_sync(c, 0);
     expect_epoch_sync(c, 1);
 }
@@ -201,7 +283,9 @@ TEST(CaptureLoopback, SigintClean) {
     LoopbackServer server(std::move(script), ca());
     auto c = config(server, "sigint");
     c.options.duration_s = 0;
-    EXPECT_EQ(stop_after(server, c, "frame", 3), 0);
+    SyncSignal synced;
+    observe_sync(c, synced);
+    EXPECT_EQ(stop_when_synced(c, synced, SIGINT), 0);
     expect_epoch_sync(c, 0);
 }
 TEST(CaptureLoopback, SigtermClean) {
@@ -210,7 +294,9 @@ TEST(CaptureLoopback, SigtermClean) {
     LoopbackServer server(std::move(script), ca());
     auto c = config(server, "sigterm");
     c.options.duration_s = 0;
-    EXPECT_EQ(stop_after(server, c, "frame", 3, SIGTERM), 0);
+    SyncSignal synced;
+    observe_sync(c, synced);
+    EXPECT_EQ(stop_when_synced(c, synced, SIGTERM), 0);
     expect_epoch_sync(c, 0);
 }
 TEST(CaptureLoopback, SecondSigint) {
@@ -221,9 +307,11 @@ TEST(CaptureLoopback, SecondSigint) {
     auto c = config(server, "second_signal");
     c.options.duration_s = 0;
     c.tuning.close_timeout = c.tuning.shutdown_deadline = 20s * scale();
+    SyncSignal synced;
+    observe_sync(c, synced);
     auto result = std::async(std::launch::async,
                              [&] { return run_capture(c, std::chrono::steady_clock::now()); });
-    EXPECT_TRUE(server.wait_for("frame", 3, timeout()));
+    EXPECT_TRUE(synced.wait());
     std::raise(SIGINT);
     EXPECT_TRUE(server.wait_for("close_requested", 1, timeout()));
     std::raise(SIGINT);
@@ -425,9 +513,29 @@ TEST(CaptureLoopback, DurationBeforeSyncExitsZero) {
     script.depth_delay = 10s * scale();
     LoopbackServer server(std::move(script), ca());
     auto c = config(server, "before_sync");
+    c.started_wall_ns = wall_clock_ns();
+    testing::internal::CaptureStderr();
     EXPECT_EQ(run_capture(c, std::chrono::steady_clock::now()), 0);
+    const auto log = testing::internal::GetCapturedStderr();
+    EXPECT_NE(log.find("info summary "), std::string::npos);
+    EXPECT_NE(log.find("syncs=0"), std::string::npos);
     EXPECT_GT(server.count("depth"), 0u);
+    const auto names = file_names(c.options.venue, "BTCUSDT", utc_date(c.started_wall_ns));
+    ASSERT_TRUE(std::filesystem::is_regular_file(c.options.output_dir / names.orderbook));
     EXPECT_TRUE(rows(c, "_orderbook.csv").empty());
+}
+TEST(CaptureLoopback, ArchiveWarningNamesPreviousRun) {
+    ServerScript script;
+    script.frames = frames();
+    LoopbackServer server(std::move(script), ca());
+    auto c = config(server, "archive_warning");
+    c.started_wall_ns = wall_clock_ns();
+    ASSERT_EQ(run_capture(c, std::chrono::steady_clock::now()), 0);
+    testing::internal::CaptureStderr();
+    EXPECT_EQ(run_capture(c, std::chrono::steady_clock::now()), 0);
+    const auto log = testing::internal::GetCapturedStderr();
+    EXPECT_NE(log.find("existing output moved to "), std::string::npos);
+    EXPECT_NE(log.find("replaced_"), std::string::npos);
 }
 struct RecordedBooks {
     std::mutex mutex;

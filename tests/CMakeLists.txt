@@ -50,6 +50,7 @@ add_executable(unit_tests
     net_attempt_limiter_test.cpp
     net_dispatch_policy_test.cpp
     net_rest_scheduler_test.cpp
+    net_rest_transport_test.cpp
     net_budget_test.cpp
     net_capture_loopback_test.cpp
     support/test_ca.cpp

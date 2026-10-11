@@ -57,5 +57,28 @@ no sockets. Live public endpoint availability is probed separately from determin
   script invokes `clang-tidy-15` directly on tracked application translation units, with the
   Clang compile database and a source-only header filter. Suppressions name a specific check
   and explain the reserved storage or simdjson rvalue API requirement.
-- Release publication was explicitly authorized by the user on 2026-10-11: the repository
-  was made public immediately. The annotated submission tag remains a final release step.
+- Public repository visibility was explicitly authorized by the user on 2026-10-11 and
+  applied immediately. The annotated submission tag remains a final release step.
+
+## Final independent review
+
+One fresh supervisor reviewed the implementation from the task-24 baseline through `5f8a312`.
+It found no critical issues and two important issues: the fixed-name writable-directory probe
+could overwrite an existing file or symlink target, and the REST deadline excluded DNS resolution.
+Both were reproduced before correction. Exclusive probe creation now preserves existing paths;
+a timer starts before resolution and completes the logical request once, including cancellation
+and late resolver callbacks. Boost's OS resolver worker may still wait for a system DNS call
+on destruction; the deadline promises request-slot release rather than a hard OS shutdown bound.
+
+The review also caught an unsupported README trade flag, a missing previous-run archive warning,
+and a header-only shutdown test that did not assert file existence. The flag is corrected; a
+failing regression now checks the archive warning; the shutdown test checks real files and its
+zero-sync summary. The archive warning is treated as a required fix because the design promises
+it and users need to locate previous output. Signal/reconnect tests now wait for an actual
+book-sync row before interruption, preserving real-file output under slower sanitizer runs.
+
+Startup validation is a separate lifecycle stage: expiry there intentionally creates no files,
+as task 26 specifies. After validation, expiry before book sync leaves header-only files and a
+summary. Malformed replay CSV fails the file; semantic payload failures follow the shared
+processor's documented count/resync policy. These are explicit contract choices, not omitted
+error handling. Final fix verification uses the full test and CI gates, without another review cycle.

@@ -30,9 +30,7 @@ std::string describe(const HttpResult& r) {
 
 RestScheduler::RestScheduler(boost::asio::io_context& io, Venue venue, VenueEndpoints endpoints,
                              const NetTuning& tuning, RestTransport& transport, IoMetrics& metrics)
-    : io_(io),
-      venue_(venue),
-      endpoints_(std::move(endpoints)),
+    : endpoints_(std::move(endpoints)),
       tuning_(tuning),
       transport_(transport),
       metrics_(metrics),

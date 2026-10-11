@@ -1340,6 +1340,15 @@ TDD applies: each module's tests are written before its implementation.
 3. **US IP block (M5):** confirm GitHub-hosted runners receive HTTP 451 from Binance; if they do
    not, a live smoke job is added to CI.
 
+**Implementation results (2026-10-11):** all three gates above passed. The real implementation
+completed both-venue 10-minute captures and 30-minute Spot captures before and after coverage
+refresh, with positive comparisons, zero mismatches and RSS below the 84 MiB budget. The earlier
+30-minute run exhausted coverage once and resynced; the refresh-enabled run needed neither
+refresh nor resync in that market window. Independent tests exercise refresh paths.
+[Recorded measurements](benchmarks.md) include exact counts and replay equality. The
+[GitHub-hosted probe](https://github.com/GruffElixir/binance-lob-capture/actions/runs/38162922191)
+returned HTTP 451 for both venues; deterministic TLS loopback tests remain the CI network gate.
+
 ## 16. Milestones
 
 Milestone IDs used throughout this document. Each milestone ends with CI green and every

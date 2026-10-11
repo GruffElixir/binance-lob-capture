@@ -8,6 +8,7 @@
 
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/asio/ssl/host_name_verification.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/ssl.hpp>
@@ -38,34 +39,41 @@ class BeastRestTransport::Session : public std::enable_shared_from_this<Session>
 public:
     Session(asio::io_context& io, asio::ssl::context& tls, JsonWorkspace& workspace,
             const NetTuning& tuning, Endpoint endpoint, std::string target,
-            std::function<void(HttpResult)> done)
+            std::function<void(HttpResult)> done, ResolveFn resolve)
         : resolver_(io),
+          timer_(io),
           stream_(io, tls),
           workspace_(workspace),
           tuning_(tuning),
           endpoint_(std::move(endpoint)),
           target_(std::move(target)),
-          done_(std::move(done)) {}
+          done_(std::move(done)),
+          resolve_(std::move(resolve)) {}
 
     void start() {
         deadline_ = std::chrono::steady_clock::now() + tuning_.rest_timeout;
+        timer_.expires_at(deadline_);
+        timer_.async_wait([self = shared_from_this()](const beast::error_code& ec) {
+            if (!ec && !self->stopped_)
+                self->fail();
+        });
         // SNI (the macro form uses old-style casts) and hostname verification.
         SSL_ctrl(stream_.native_handle(), SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name,
                  const_cast<char*>(endpoint_.host.c_str()));
         stream_.set_verify_callback(asio::ssl::host_name_verification(endpoint_.host));
-        resolver_.async_resolve(
-            endpoint_.host, endpoint_.port,
-            [self = shared_from_this()](const beast::error_code& ec,
-                                        const tcp::resolver::results_type& results) {
-                self->on_resolve(ec, results);
-            });
+        ResolveDone done = [self = shared_from_this()](const beast::error_code& ec,
+                                                       const tcp::resolver::results_type& results) {
+            self->on_resolve(ec, results);
+        };
+        if (resolve_)
+            resolve_(endpoint_, std::move(done));
+        else
+            resolver_.async_resolve(endpoint_.host, endpoint_.port, std::move(done));
     }
 
     void cancel() noexcept {
-        stopped_ = true;
-        resolver_.cancel();
-        beast::error_code ignored;
-        beast::get_lowest_layer(stream_).socket().close(ignored);
+        done_ = nullptr;
+        close();
     }
 
 private:
@@ -153,6 +161,13 @@ private:
     }
 
     void close() noexcept {
+        stopped_ = true;
+        try {
+            timer_.cancel();
+            resolver_.cancel();
+        } catch (...) {
+            // Socket cancellation must still happen during teardown.
+        }
         beast::error_code ignored;
         beast::get_lowest_layer(stream_).socket().close(ignored);
     }
@@ -167,12 +182,14 @@ private:
     }
 
     tcp::resolver resolver_;
+    asio::steady_timer timer_;
     beast::ssl_stream<beast::tcp_stream> stream_;
     JsonWorkspace& workspace_;
     NetTuning tuning_;
     Endpoint endpoint_;
     std::string target_;
     std::function<void(HttpResult)> done_;
+    ResolveFn resolve_;
     std::chrono::steady_clock::time_point deadline_;
     http::request<http::empty_body> request_;
     beast::flat_buffer buffer_;
@@ -181,8 +198,9 @@ private:
 };
 
 BeastRestTransport::BeastRestTransport(asio::io_context& io, asio::ssl::context& tls,
-                                       JsonWorkspace& workspace, const NetTuning& tuning)
-    : io_(io), tls_(tls), workspace_(workspace), tuning_(tuning) {}
+                                       JsonWorkspace& workspace, const NetTuning& tuning,
+                                       ResolveFn resolve)
+    : io_(io), tls_(tls), workspace_(workspace), tuning_(tuning), resolve_(std::move(resolve)) {}
 
 BeastRestTransport::~BeastRestTransport() {
     cancel_all();
@@ -198,7 +216,7 @@ void BeastRestTransport::get(const Endpoint& endpoint, std::string target,
                                    [](const std::weak_ptr<Session>& s) { return s.expired(); }),
                     sessions_.end());
     auto session = std::make_shared<Session>(io_, tls_, workspace_, tuning_, endpoint,
-                                             std::move(target), std::move(done));
+                                             std::move(target), std::move(done), resolve_);
     sessions_.push_back(session);
     session->start();
 }

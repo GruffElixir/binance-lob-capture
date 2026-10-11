@@ -51,6 +51,7 @@ ParseStatus read_levels(value& v, LevelRule rule, ParseStatus when_full, Push&& 
     std::int64_t previous = 0;
     for (auto level_result : levels) {
         value level_value;
+        // NOLINTNEXTLINE(performance-move-const-arg): simdjson get(T&) is rvalue-qualified
         if (std::move(level_result).get(level_value) != simdjson::SUCCESS) {
             return ParseStatus::Malformed;
         }
@@ -113,12 +114,14 @@ ParseStatus visit_root(simdjson::ondemand::parser& parser, PaddedView payload,
         return from_error(e);
     }
     simdjson::ondemand::object obj;
-    if ((e = doc.get_object().get(obj)) != simdjson::SUCCESS) {
+    e = doc.get_object().get(obj);
+    if (e != simdjson::SUCCESS) {
         return from_error(e);
     }
     for (auto field_result : obj) {
         simdjson::ondemand::field field;
-        if ((e = std::move(field_result).get(field)) != simdjson::SUCCESS) {
+        e = std::move(field_result).get(field);
+        if (e != simdjson::SUCCESS) {
             return from_error(e);
         }
         std::string_view key;

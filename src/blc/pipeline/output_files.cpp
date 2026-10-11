@@ -3,7 +3,6 @@
 #include "blc/core/errors.hpp"
 #include "blc/csv/schema.hpp"
 
-#include <fstream>
 #include <system_error>
 
 namespace blc {
@@ -46,15 +45,19 @@ fs::path prepare_output_dir(const fs::path& dir) {
     } else if (!fs::create_directories(dir, ec) || ec) {
         fail(dir, "cannot create output directory (" + ec.message() + ")");
     }
-    // Permission bits alone do not tell (ACLs, read-only mounts): try to create a file.
-    const fs::path probe = dir / ".binance_capture_write_probe";
-    {
-        std::ofstream const out(probe, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            fail(dir, "output directory is not writable");
-        }
+    // Directory creation is exclusive: never truncate or follow a pre-existing probe.
+    // Actual output-file creation checks file ACLs before any WebSocket is started.
+    fs::path probe = dir / ".binance_capture_write_probe";
+    for (unsigned k = 1;; ++k) {
+        ec.clear();
+        if (fs::create_directory(probe, ec))
+            break;
+        if ((ec && ec != std::errc::file_exists) || k > 10000)
+            fail(dir, "output directory is not writable (" + ec.message() + ")");
+        probe = dir / (".binance_capture_write_probe-" + std::to_string(k));
     }
-    fs::remove(probe, ec);
+    if (!fs::remove(probe, ec) || ec)
+        fail(probe, "cannot remove output-directory probe (" + ec.message() + ")");
     const fs::path absolute = fs::absolute(dir, ec);
     return ec ? dir : absolute;
 }
