@@ -34,7 +34,9 @@ add_executable(unit_tests
     book_sequence_test.cpp
     book_diff_window_test.cpp
     book_depth5_check_test.cpp
-    book_sync_test.cpp)
+    book_sync_test.cpp
+    book_property_test.cpp
+    support/exchange_sim.cpp)
 target_link_libraries(unit_tests PRIVATE blc_core GTest::gtest_main)
 set(BLC_TEST_SOURCE_DIR "${PROJECT_SOURCE_DIR}")
 configure_file(support/paths.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/support/paths.hpp" @ONLY)
